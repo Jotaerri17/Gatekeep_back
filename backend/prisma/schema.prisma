@@ -1,0 +1,72 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum TransactionType {
+  INCOME
+  EXPENSE
+}
+
+enum CategoryType {
+  INCOME
+  EXPENSE
+}
+
+model User {
+  id           String        @id @db.Uuid
+  email        String        @unique
+  fullName     String?
+  currency     String        @default("BRL")
+  categories   Category[]
+  transactions Transaction[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@map("Users")
+}
+
+model Category {
+  id           String        @id @default(uuid()) @db.Uuid
+  userId       String        @db.Uuid
+  name         String
+  type         CategoryType
+  color        String?
+  icon         String?
+  monthlyLimit Decimal?      @db.Decimal(14, 2)
+  isActive     Boolean       @default(true)
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions Transaction[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@unique([userId, name, type])
+  @@index([userId, isActive])
+  @@map("categories")
+}
+
+model Transaction {
+  id              String          @id @default(uuid()) @db.Uuid
+  userId          String          @db.Uuid
+  categoryId      String?         @db.Uuid
+  type            TransactionType
+  title           String
+  description     String?
+  amount          Decimal         @db.Decimal(14, 2)
+  transactionDate DateTime
+  user            User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category        Category?       @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@index([userId, transactionDate])
+  @@index([categoryId])
+  @@index([userId, type, transactionDate])
+  @@map("transactions")
+}
