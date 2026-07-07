@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import './config/load-env';
 import { NestFactory } from '@nestjs/core';
 import {
   FastifyAdapter,
@@ -18,4 +18,4 @@ async function bootstrap() {
   });
   await app.listen(3001, '0.0.0.0'); // Backend vai rodar na porta 3001
 }
-bootstrap();
+void bootstrap();
