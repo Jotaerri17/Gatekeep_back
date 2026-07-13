@@ -19,32 +19,69 @@ enum CategoryType {
   EXPENSE
 }
 
+enum TransactionSource {
+  MANUAL
+  PLUGGY
+}
+
+enum ExpenseNature {
+  FIXED
+  VARIABLE
+  ONE_OFF
+}
+
+enum TransactionStatus {
+  POSTED
+  PENDING
+}
+
+enum BankConnectionStatus {
+  CONNECTING
+  ACTIVE
+  WAITING_USER_INPUT
+  ERROR
+  DISCONNECTED
+}
+
+enum WebhookEventStatus {
+  PENDING
+  PROCESSING
+  PROCESSED
+  FAILED
+}
+
 model User {
-  id           String        @id @db.Uuid
-  email        String        @unique
-  fullName     String?
-  currency     String        @default("BRL")
-  categories   Category[]
-  transactions Transaction[]
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
+  id                  String           @id @db.Uuid
+  email               String           @unique
+  fullName            String?
+  currency            String           @default("BRL")
+  timezone            String           @default("America/Sao_Paulo")
+  defaultMonthlyLimit Decimal?         @db.Decimal(14, 2)
+  categories          Category[]
+  transactions        Transaction[]
+  monthlyBudgets      MonthlyBudget[]
+  bankConnections     BankConnection[]
+  bankAccounts        BankAccount[]
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
 
   @@map("Users")
 }
 
 model Category {
-  id           String        @id @default(uuid()) @db.Uuid
-  userId       String        @db.Uuid
+  id           String           @id @default(uuid()) @db.Uuid
+  userId       String           @db.Uuid
   name         String
   type         CategoryType
   color        String?
   icon         String?
-  monthlyLimit Decimal?      @db.Decimal(14, 2)
-  isActive     Boolean       @default(true)
-  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  monthlyLimit Decimal?         @db.Decimal(14, 2)
+  isActive     Boolean          @default(true)
+  user         User             @relation(fields: [userId], references: [id], onDelete: Cascade)
   transactions Transaction[]
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
+  budgets      CategoryBudget[]
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
 
   @@unique([userId, name, type])
   @@index([userId, isActive])
@@ -52,21 +89,122 @@ model Category {
 }
 
 model Transaction {
-  id              String          @id @default(uuid()) @db.Uuid
-  userId          String          @db.Uuid
-  categoryId      String?         @db.Uuid
-  type            TransactionType
-  title           String
-  description     String?
-  amount          Decimal         @db.Decimal(14, 2)
-  transactionDate DateTime
-  user            User            @relation(fields: [userId], references: [id], onDelete: Cascade)
-  category        Category?       @relation(fields: [categoryId], references: [id], onDelete: SetNull)
-  createdAt       DateTime        @default(now())
-  updatedAt       DateTime        @updatedAt
+  id                   String            @id @default(uuid()) @db.Uuid
+  userId               String            @db.Uuid
+  categoryId           String?           @db.Uuid
+  bankAccountId        String?           @db.Uuid
+  type                 TransactionType
+  source               TransactionSource @default(MANUAL)
+  nature               ExpenseNature?
+  status               TransactionStatus @default(POSTED)
+  title                String
+  description          String?
+  amount               Decimal           @db.Decimal(14, 2)
+  transactionDate      DateTime
+  externalId           String?
+  providerCategoryId   String?
+  providerCategoryName String?
+  excludedFromBudget   Boolean           @default(false)
+  user                 User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category             Category?         @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  bankAccount          BankAccount?      @relation(fields: [bankAccountId], references: [id], onDelete: SetNull)
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
 
+  @@unique([bankAccountId, externalId])
   @@index([userId, transactionDate])
   @@index([categoryId])
+  @@index([bankAccountId])
   @@index([userId, type, transactionDate])
+  @@index([userId, status, transactionDate])
   @@map("transactions")
+}
+
+model MonthlyBudget {
+  id              String           @id @default(uuid()) @db.Uuid
+  userId          String           @db.Uuid
+  referenceMonth  DateTime         @db.Date
+  totalLimit      Decimal          @db.Decimal(14, 2)
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  categoryBudgets CategoryBudget[]
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  @@unique([userId, referenceMonth])
+  @@index([userId, referenceMonth])
+  @@map("monthly_budgets")
+}
+
+model CategoryBudget {
+  id              String        @id @default(uuid()) @db.Uuid
+  monthlyBudgetId String        @db.Uuid
+  categoryId      String        @db.Uuid
+  limit           Decimal       @db.Decimal(14, 2)
+  monthlyBudget   MonthlyBudget @relation(fields: [monthlyBudgetId], references: [id], onDelete: Cascade)
+  category        Category      @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@unique([monthlyBudgetId, categoryId])
+  @@index([categoryId])
+  @@map("category_budgets")
+}
+
+model BankConnection {
+  id                 String               @id @default(uuid()) @db.Uuid
+  userId             String               @db.Uuid
+  provider           String               @default("PLUGGY")
+  externalItemId     String               @unique
+  connectorId        Int?
+  institutionName    String?
+  institutionLogoUrl String?
+  status             BankConnectionStatus @default(CONNECTING)
+  lastSyncedAt       DateTime?
+  errorCode          String?
+  consentExpiresAt   DateTime?
+  user               User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accounts           BankAccount[]
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+
+  @@index([userId, status])
+  @@map("bank_connections")
+}
+
+model BankAccount {
+  id                String         @id @default(uuid()) @db.Uuid
+  userId            String         @db.Uuid
+  bankConnectionId  String         @db.Uuid
+  externalAccountId String         @unique
+  name              String
+  type              String
+  subtype           String?
+  currency          String         @default("BRL")
+  balance           Decimal?       @db.Decimal(14, 2)
+  numberLastFour    String?
+  user              User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bankConnection    BankConnection @relation(fields: [bankConnectionId], references: [id], onDelete: Cascade)
+  transactions      Transaction[]
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  @@index([userId])
+  @@index([bankConnectionId])
+  @@map("bank_accounts")
+}
+
+model WebhookEvent {
+  id          String             @id @default(uuid()) @db.Uuid
+  externalId  String             @unique
+  event       String
+  payload     Json
+  status      WebhookEventStatus @default(PENDING)
+  attempts    Int                @default(0)
+  lastError   String?
+  processedAt DateTime?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  @@index([status, createdAt])
+  @@map("webhook_events")
 }

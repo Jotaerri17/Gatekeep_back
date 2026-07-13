@@ -1,164 +1,190 @@
 import {
   BadRequestException,
-  ConflictException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { CategoryType, Prisma } from '@prisma/client';
+import type { AuthenticatedUser } from '../auth/authenticated-user';
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
-import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 
-const uuidRegex =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const currencyRegex = /^[A-Z]{3}$/;
+const defaultCategories = [
+  {
+    name: 'Moradia',
+    type: CategoryType.EXPENSE,
+    color: '#6366f1',
+    icon: 'House',
+  },
+  {
+    name: 'Alimentação',
+    type: CategoryType.EXPENSE,
+    color: '#f59e0b',
+    icon: 'Utensils',
+  },
+  {
+    name: 'Transporte',
+    type: CategoryType.EXPENSE,
+    color: '#0ea5e9',
+    icon: 'Car',
+  },
+  {
+    name: 'Saúde',
+    type: CategoryType.EXPENSE,
+    color: '#ef4444',
+    icon: 'HeartPulse',
+  },
+  {
+    name: 'Educação',
+    type: CategoryType.EXPENSE,
+    color: '#8b5cf6',
+    icon: 'GraduationCap',
+  },
+  {
+    name: 'Lazer',
+    type: CategoryType.EXPENSE,
+    color: '#ec4899',
+    icon: 'PartyPopper',
+  },
+  {
+    name: 'Assinaturas',
+    type: CategoryType.EXPENSE,
+    color: '#14b8a6',
+    icon: 'CreditCard',
+  },
+  {
+    name: 'Compras',
+    type: CategoryType.EXPENSE,
+    color: '#f97316',
+    icon: 'ShoppingBag',
+  },
+  {
+    name: 'Impostos e Taxas',
+    type: CategoryType.EXPENSE,
+    color: '#64748b',
+    icon: 'Receipt',
+  },
+  {
+    name: 'Outros',
+    type: CategoryType.EXPENSE,
+    color: '#71717a',
+    icon: 'CircleEllipsis',
+  },
+  {
+    name: 'Receitas',
+    type: CategoryType.INCOME,
+    color: '#22c55e',
+    icon: 'TrendingUp',
+  },
+] as const;
 
 @Injectable()
 export class UsersService {
   constructor(private readonly prisma: PrismaService) {}
 
-  findAll() {
-    return this.prisma.user.findMany({
-      orderBy: { createdAt: 'desc' },
+  async bootstrap(authUser: AuthenticatedUser) {
+    if (!authUser.email) {
+      throw new BadRequestException(
+        'Authenticated user does not have an email',
+      );
+    }
+
+    const normalizedEmail = authUser.email.trim().toLowerCase();
+    const user = await this.prisma.$transaction(async (tx) => {
+      const savedUser = await tx.user.upsert({
+        where: { id: authUser.id },
+        update: {
+          email: normalizedEmail,
+          ...(authUser.fullName ? { fullName: authUser.fullName } : {}),
+        },
+        create: {
+          id: authUser.id,
+          email: normalizedEmail,
+          fullName: authUser.fullName,
+          currency: 'BRL',
+        },
+      });
+
+      await Promise.all(
+        defaultCategories.map((category) =>
+          tx.category.upsert({
+            where: {
+              userId_name_type: {
+                userId: savedUser.id,
+                name: category.name,
+                type: category.type,
+              },
+            },
+            update: {},
+            create: { userId: savedUser.id, ...category },
+          }),
+        ),
+      );
+
+      return savedUser;
     });
+
+    return this.serialize(user);
   }
 
-  async findOne(id: string) {
-    this.assertUuid(id, 'id');
-
+  async findMe(authUser: AuthenticatedUser) {
     const user = await this.prisma.user.findUnique({
-      where: { id },
+      where: { id: authUser.id },
     });
 
     if (!user) {
-      throw new NotFoundException('User not found');
+      return this.bootstrap(authUser);
     }
 
-    return user;
+    return this.serialize(user);
   }
 
-  async create(createUserDto: CreateUserDto) {
-    const data = this.toCreateData(createUserDto);
-
-    try {
-      return await this.prisma.user.create({ data });
-    } catch (error) {
-      this.handlePrismaError(error);
-    }
-  }
-
-  async update(id: string, updateUserDto: UpdateUserDto) {
-    this.assertUuid(id, 'id');
-
-    const data = this.toUpdateData(updateUserDto);
-
-    if (Object.keys(data).length === 0) {
+  async updateMe(authUser: AuthenticatedUser, dto: UpdateUserDto) {
+    if (dto.fullName === undefined && dto.timezone === undefined) {
       throw new BadRequestException('At least one field must be provided');
     }
 
     try {
-      return await this.prisma.user.update({
-        where: { id },
-        data,
-      });
-    } catch (error) {
-      this.handlePrismaError(error);
-    }
-  }
-
-  async remove(id: string) {
-    this.assertUuid(id, 'id');
-
-    try {
-      await this.prisma.user.delete({
-        where: { id },
+      const user = await this.prisma.user.update({
+        where: { id: authUser.id },
+        data: {
+          ...(dto.fullName !== undefined
+            ? { fullName: this.normalizeOptionalText(dto.fullName) }
+            : {}),
+          ...(dto.timezone !== undefined ? { timezone: dto.timezone } : {}),
+        },
       });
 
-      return { deleted: true };
+      return this.serialize(user);
     } catch (error) {
-      this.handlePrismaError(error);
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2025'
+      ) {
+        throw new NotFoundException('User not found');
+      }
+      throw error;
     }
   }
 
-  private toCreateData(dto: CreateUserDto): Prisma.UserCreateInput {
-    this.assertUuid(dto.id, 'id');
-    this.assertEmail(dto.email);
-
-    if (dto.currency !== undefined) {
-      this.assertCurrency(dto.currency);
-    }
-
-    return {
-      id: dto.id,
-      email: dto.email.trim().toLowerCase(),
-      fullName: this.normalizeOptionalText(dto.fullName),
-      currency: dto.currency?.trim().toUpperCase() ?? 'BRL',
-    };
-  }
-
-  private toUpdateData(dto: UpdateUserDto): Prisma.UserUpdateInput {
-    const data: Prisma.UserUpdateInput = {};
-
-    if (dto.email !== undefined) {
-      this.assertEmail(dto.email);
-      data.email = dto.email.trim().toLowerCase();
-    }
-
-    if (dto.fullName !== undefined) {
-      data.fullName = this.normalizeOptionalText(dto.fullName);
-    }
-
-    if (dto.currency !== undefined) {
-      this.assertCurrency(dto.currency);
-      data.currency = dto.currency.trim().toUpperCase();
-    }
-
-    return data;
-  }
-
-  private assertUuid(value: string | undefined, field: string) {
-    if (!value || !uuidRegex.test(value)) {
-      throw new BadRequestException(`${field} must be a valid UUID`);
-    }
-  }
-
-  private assertEmail(value: string | undefined) {
-    if (!value || !emailRegex.test(value.trim())) {
-      throw new BadRequestException('email must be valid');
-    }
-  }
-
-  private assertCurrency(value: string) {
-    if (!currencyRegex.test(value.trim().toUpperCase())) {
-      throw new BadRequestException('currency must be a valid ISO code');
-    }
-  }
-
-  private normalizeOptionalText(value?: string | null) {
-    if (value === undefined) {
-      return undefined;
-    }
-
-    if (value === null) {
-      return null;
-    }
-
+  private normalizeOptionalText(value: string | null) {
+    if (value === null) return null;
     const trimmedValue = value.trim();
     return trimmedValue.length > 0 ? trimmedValue : null;
   }
 
-  private handlePrismaError(error: unknown): never {
-    if (error instanceof Prisma.PrismaClientKnownRequestError) {
-      if (error.code === 'P2002') {
-        throw new ConflictException('User already exists');
-      }
-
-      if (error.code === 'P2025') {
-        throw new NotFoundException('User not found');
-      }
-    }
-
-    throw error;
+  private serialize(user: {
+    id: string;
+    email: string;
+    fullName: string | null;
+    currency: string;
+    timezone: string;
+    defaultMonthlyLimit: Prisma.Decimal | null;
+    createdAt: Date;
+    updatedAt: Date;
+  }) {
+    return {
+      ...user,
+      defaultMonthlyLimit: user.defaultMonthlyLimit?.toFixed(2) ?? null,
+    };
   }
 }
