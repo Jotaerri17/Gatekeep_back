@@ -2,6 +2,7 @@ import {
   BadGatewayException,
   BadRequestException,
   Injectable,
+  Logger,
   NotFoundException,
   ServiceUnavailableException,
   UnauthorizedException,
@@ -46,6 +47,11 @@ type PluggyAccount = {
   number?: string;
 };
 
+type PluggyConnector = {
+  id: number;
+  name: string;
+};
+
 type PluggyTransaction = {
   id: string;
   date: string;
@@ -71,9 +77,13 @@ type PluggyWebhook = {
 
 @Injectable()
 export class BankConnectionsService {
+  private static readonly meuPluggyProvider = 'MEU_PLUGGY';
+  private static readonly connectorCacheTtlMs = 6 * 60 * 60 * 1000;
   private readonly apiUrl =
     process.env.PLUGGY_API_URL ?? 'https://api.pluggy.ai';
+  private readonly logger = new Logger(BankConnectionsService.name);
   private apiKey: { value: string; expiresAt: number } | null = null;
+  private meuPluggyConnector: { id: number; expiresAt: number } | null = null;
 
   constructor(private readonly prisma: PrismaService) {}
 
@@ -105,13 +115,11 @@ export class BankConnectionsService {
       itemId = connection.externalItemId;
     }
 
+    const connectorId = await this.getMeuPluggyConnectorId();
     const body: Record<string, unknown> = {
       options: {
         clientUserId: userId,
         avoidDuplicates: true,
-        ...(process.env.PLUGGY_WEBHOOK_URL
-          ? { webhookUrl: process.env.PLUGGY_WEBHOOK_URL }
-          : {}),
       },
       ...(itemId ? { itemId } : {}),
     };
@@ -121,7 +129,7 @@ export class BankConnectionsService {
     );
     if (!token.accessToken)
       throw new BadGatewayException('Pluggy did not return a connect token');
-    return { accessToken: token.accessToken };
+    return { accessToken: token.accessToken, connectorId };
   }
 
   async completeConnection(userId: string, itemId: string) {
@@ -150,9 +158,6 @@ export class BankConnectionsService {
 
   async sync(userId: string, id: string) {
     const connection = await this.findOwned(userId, id);
-    await this.pluggyRequest(`/items/${connection.externalItemId}`, {
-      method: 'PATCH',
-    });
     await this.syncItem(userId, connection.externalItemId);
     return { synced: true, syncedAt: new Date() };
   }
@@ -171,6 +176,43 @@ export class BankConnectionsService {
       data: { status: BankConnectionStatus.DISCONNECTED },
     });
     return { disconnected: true, historicalDataPreserved: true };
+  }
+
+  async deleteImportedData(userId: string, id: string) {
+    const connection = await this.findOwned(userId, id);
+    if (connection.status !== BankConnectionStatus.DISCONNECTED) {
+      throw new BadRequestException(
+        'Disconnect Meu Pluggy before deleting imported data',
+      );
+    }
+
+    const accounts = await this.prisma.bankAccount.findMany({
+      where: { userId, bankConnectionId: id },
+      select: { id: true },
+    });
+    const accountIds = accounts.map((account) => account.id);
+    const deletedTransactions = accountIds.length
+      ? await this.prisma.transaction.deleteMany({
+          where: {
+            userId,
+            source: TransactionSource.PLUGGY,
+            bankAccountId: { in: accountIds },
+          },
+        })
+      : { count: 0 };
+    const deletedAccounts = await this.prisma.bankAccount.deleteMany({
+      where: { userId, bankConnectionId: id },
+    });
+    await this.prisma.bankConnection.update({
+      where: { id },
+      data: { lastSyncedAt: null },
+    });
+
+    return {
+      deleted: true,
+      transactions: deletedTransactions.count,
+      accounts: deletedAccounts.count,
+    };
   }
 
   async enqueueWebhook(secret: string | undefined, rawPayload: unknown) {
@@ -231,7 +273,15 @@ export class BankConnectionsService {
     });
     const payload = event.payload as PluggyWebhook;
     try {
-      if (
+      if (event.event === 'item/deleted' && payload.itemId) {
+        await this.prisma.bankConnection.updateMany({
+          where: { externalItemId: payload.itemId },
+          data: {
+            status: BankConnectionStatus.DISCONNECTED,
+            errorCode: null,
+          },
+        });
+      } else if (
         event.event === 'transactions/deleted' &&
         payload.transactionIds &&
         payload.accountId
@@ -336,7 +386,7 @@ export class BankConnectionsService {
     accountId: string,
   ) {
     let path: string | null =
-      `/transactions?accountId=${encodeURIComponent(accountId)}&pageSize=500`;
+      `/v2/transactions?accountId=${encodeURIComponent(accountId)}`;
     const categories = await this.prisma.category.findMany({
       where: { userId, isActive: true },
     });
@@ -434,6 +484,7 @@ export class BankConnectionsService {
     return this.prisma.bankConnection.upsert({
       where: { externalItemId: item.id },
       update: {
+        provider: BankConnectionsService.meuPluggyProvider,
         connectorId: item.connector?.id ?? item.connectorId ?? null,
         institutionName: item.connector?.name ?? null,
         institutionLogoUrl: item.connector?.imageUrl ?? null,
@@ -442,6 +493,7 @@ export class BankConnectionsService {
       },
       create: {
         userId,
+        provider: BankConnectionsService.meuPluggyProvider,
         externalItemId: item.id,
         connectorId: item.connector?.id ?? item.connectorId ?? null,
         institutionName: item.connector?.name ?? null,
@@ -458,7 +510,12 @@ export class BankConnectionsService {
       return BankConnectionStatus.ACTIVE;
     if (status?.startsWith('WAITING'))
       return BankConnectionStatus.WAITING_USER_INPUT;
-    if (status === 'ERROR') return BankConnectionStatus.ERROR;
+    if (status === 'USER_AUTHORIZATION_PENDING')
+      return BankConnectionStatus.WAITING_USER_INPUT;
+    if (status === 'USER_AUTHORIZATION_REVOKED')
+      return BankConnectionStatus.DISCONNECTED;
+    if (status === 'ERROR' || status === 'LOGIN_ERROR' || status === 'OUTDATED')
+      return BankConnectionStatus.ERROR;
     return BankConnectionStatus.CONNECTING;
   }
 
@@ -487,10 +544,29 @@ export class BankConnectionsService {
     });
     if (response.status === 404)
       throw new NotFoundException('Pluggy resource not found');
-    if (!response.ok)
-      throw new BadGatewayException(
-        `Pluggy request failed with ${response.status}`,
+    if (!response.ok) {
+      const payload = await this.readPluggyError(response);
+      if (payload.code === 'ITEM_USER_ALREADY_EXISTS') {
+        throw new BadRequestException(
+          'Este banco já está conectado ao seu Gatekeep.',
+        );
+      }
+      if (payload.code === 'TRIAL_CLIENT_ITEM_CREATE_NOT_ALLOWED') {
+        throw new ServiceUnavailableException(
+          'A aplicação Pluggy ainda não está liberada para criar conexões Meu Pluggy.',
+        );
+      }
+      const resource = new URL(url).pathname.replace(
+        /\/[0-9a-f]{8}-[0-9a-f-]{27,}/gi,
+        '/:id',
       );
+      this.logger.warn(
+        `Pluggy ${init.method ?? 'GET'} ${resource} failed with ${response.status}${payload.code ? ` (${payload.code})` : ''}${payload.message ? `: ${payload.message}` : ''}`,
+      );
+      throw new BadGatewayException(
+        `Pluggy request failed with ${response.status} on ${resource}`,
+      );
+    }
     if (response.status === 204) return undefined as T;
     return (await response.json()) as T;
   }
@@ -523,6 +599,54 @@ export class BankConnectionsService {
     return data.apiKey;
   }
 
+  private async getMeuPluggyConnectorId() {
+    if (
+      this.meuPluggyConnector &&
+      this.meuPluggyConnector.expiresAt > Date.now()
+    ) {
+      return this.meuPluggyConnector.id;
+    }
+
+    const response = await this.pluggyRequest<
+      PluggyConnector[] | { results?: PluggyConnector[] }
+    >('/connectors');
+    const connectors = Array.isArray(response)
+      ? response
+      : (response.results ?? []);
+    const connector = connectors.find(
+      ({ name }) =>
+        name.replaceAll(/\s/g, '').toLocaleLowerCase('pt-BR') === 'meupluggy',
+    );
+    if (!connector) {
+      throw new ServiceUnavailableException(
+        'O conector Meu Pluggy não está habilitado nesta aplicação.',
+      );
+    }
+
+    this.meuPluggyConnector = {
+      id: connector.id,
+      expiresAt: Date.now() + BankConnectionsService.connectorCacheTtlMs,
+    };
+    return connector.id;
+  }
+
+  private async readPluggyError(response: Response) {
+    try {
+      const payload = (await response.json()) as {
+        code?: string | number;
+        codeDescription?: string;
+        message?: string;
+      };
+      const code = payload.code ?? payload.codeDescription ?? null;
+      return {
+        code: code === null ? null : String(code),
+        message: payload.message?.slice(0, 200) ?? null,
+      };
+    } catch {
+      return { code: null, message: null };
+    }
+  }
+
   private assertWebhookSecret(received: string | undefined) {
     const expected = process.env.PLUGGY_WEBHOOK_SECRET;
     if (!expected || !received)
@@ -539,7 +663,7 @@ export class BankConnectionsService {
 
   private normalizeNextPath(next: string) {
     if (!next.startsWith('http'))
-      return next.startsWith('/') ? next : `/transactions${next}`;
+      return next.startsWith('/') ? next : `/v2/transactions${next}`;
     const url = new URL(next);
     return `${url.pathname}${url.search}`;
   }

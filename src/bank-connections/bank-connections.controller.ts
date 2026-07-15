@@ -55,6 +55,14 @@ export class BankConnectionsController {
     return this.bankConnectionsService.disconnect(user.id, id);
   }
 
+  @Delete('bank-connections/:id/imported-data')
+  deleteImportedData(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('id') id: string,
+  ) {
+    return this.bankConnectionsService.deleteImportedData(user.id, id);
+  }
+
   @Public()
   @Post('integrations/pluggy/webhook')
   @HttpCode(202)
