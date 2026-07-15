@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import { CategoryType, Prisma } from '@prisma/client';
 import type { AuthenticatedUser } from '../auth/authenticated-user';
+import { BRAZIL_TIMEZONE } from '../finance/finance.utils';
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
 import { UpdateUserDto } from './dto/update-user.dto';
 
@@ -34,18 +35,6 @@ const defaultCategories = [
     icon: 'HeartPulse',
   },
   {
-    name: 'Educação',
-    type: CategoryType.EXPENSE,
-    color: '#8b5cf6',
-    icon: 'GraduationCap',
-  },
-  {
-    name: 'Lazer',
-    type: CategoryType.EXPENSE,
-    color: '#ec4899',
-    icon: 'PartyPopper',
-  },
-  {
     name: 'Assinaturas',
     type: CategoryType.EXPENSE,
     color: '#14b8a6',
@@ -56,12 +45,6 @@ const defaultCategories = [
     type: CategoryType.EXPENSE,
     color: '#f97316',
     icon: 'ShoppingBag',
-  },
-  {
-    name: 'Impostos e Taxas',
-    type: CategoryType.EXPENSE,
-    color: '#64748b',
-    icon: 'Receipt',
   },
   {
     name: 'Outros',
@@ -94,13 +77,13 @@ export class UsersService {
         where: { id: authUser.id },
         update: {
           email: normalizedEmail,
-          ...(authUser.fullName ? { fullName: authUser.fullName } : {}),
         },
         create: {
           id: authUser.id,
           email: normalizedEmail,
           fullName: authUser.fullName,
           currency: 'BRL',
+          timezone: BRAZIL_TIMEZONE,
         },
       });
 
@@ -139,7 +122,7 @@ export class UsersService {
   }
 
   async updateMe(authUser: AuthenticatedUser, dto: UpdateUserDto) {
-    if (dto.fullName === undefined && dto.timezone === undefined) {
+    if (dto.fullName === undefined) {
       throw new BadRequestException('At least one field must be provided');
     }
 
@@ -150,7 +133,6 @@ export class UsersService {
           ...(dto.fullName !== undefined
             ? { fullName: this.normalizeOptionalText(dto.fullName) }
             : {}),
-          ...(dto.timezone !== undefined ? { timezone: dto.timezone } : {}),
         },
       });
 
@@ -184,6 +166,7 @@ export class UsersService {
   }) {
     return {
       ...user,
+      timezone: BRAZIL_TIMEZONE,
       defaultMonthlyLimit: user.defaultMonthlyLimit?.toFixed(2) ?? null,
     };
   }

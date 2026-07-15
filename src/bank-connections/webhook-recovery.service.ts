@@ -9,10 +9,9 @@ export class WebhookRecoveryService implements OnModuleInit {
 
   onModuleInit() {
     if (process.env.NODE_ENV === 'test') return;
-    setImmediate(() => {
-      void this.bankConnectionsService
-        .processPendingWebhooks()
-        .catch(() => undefined);
-    });
+    if (process.env.VERCEL) return;
+    void this.bankConnectionsService
+      .processPendingWebhooks()
+      .catch(() => undefined);
   }
 }

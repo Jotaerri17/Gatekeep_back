@@ -64,6 +64,14 @@ export class BankConnectionsController {
   }
 
   @Public()
+  @Get('internal/webhooks/process-pending')
+  processPendingWebhooks(
+    @Headers('authorization') authorization: string | undefined,
+  ) {
+    return this.bankConnectionsService.recoverPendingWebhooks(authorization);
+  }
+
+  @Public()
   @Post('integrations/pluggy/webhook')
   @HttpCode(202)
   webhook(

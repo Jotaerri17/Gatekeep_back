@@ -5,9 +5,4 @@ export class UpdateUserDto {
   @IsString()
   @MaxLength(120)
   fullName?: string | null;
-
-  @IsOptional()
-  @IsString()
-  @MaxLength(80)
-  timezone?: string;
 }

@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { Prisma, TransactionStatus, TransactionType } from '@prisma/client';
 import { BudgetsService } from '../budgets/budgets.service';
 import {
+  BRAZIL_TIMEZONE,
   getMonthRange,
   money,
   parseReferenceMonth,
@@ -11,6 +12,73 @@ import { PrismaService } from '../infrastructure/prisma/prisma.service';
 import { calculateBudgetSummary } from './dashboard-calculations';
 import { DashboardQueryDto } from './dto/dashboard-query.dto';
 
+type TimelineTransaction = {
+  transactionDate: Date;
+  type: TransactionType;
+  amount: Prisma.Decimal;
+  excludedFromBudget: boolean;
+};
+
+export function buildDashboardTimeline(
+  transactions: TimelineTransaction[],
+  period: DashboardQueryDto['period'],
+  range: { start: Date; end: Date },
+  timezone = BRAZIL_TIMEZONE,
+) {
+  const totals = new Map<string, Prisma.Decimal>();
+  const labels = new Map<string, string>();
+  const dateFormatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  const hourFormatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    hour: '2-digit',
+    hourCycle: 'h23',
+  });
+
+  if (period === 'day') {
+    for (let hour = 0; hour < 24; hour += 1) {
+      const key = String(hour).padStart(2, '0');
+      labels.set(key, `${key}h`);
+      totals.set(key, new Prisma.Decimal(0));
+    }
+  } else {
+    const labelFormatter = new Intl.DateTimeFormat('pt-BR', {
+      timeZone: timezone,
+      ...(period === 'week' ? { weekday: 'short' } : { day: '2-digit' }),
+    });
+    const cursor = new Date(range.start);
+    while (cursor < range.end) {
+      const key = dateFormatter.format(cursor);
+      labels.set(key, labelFormatter.format(cursor));
+      totals.set(key, new Prisma.Decimal(0));
+      cursor.setUTCDate(cursor.getUTCDate() + 1);
+    }
+  }
+
+  for (const item of transactions) {
+    if (item.type !== TransactionType.EXPENSE || item.excludedFromBudget)
+      continue;
+    const key =
+      period === 'day'
+        ? (hourFormatter
+            .formatToParts(item.transactionDate)
+            .find((part) => part.type === 'hour')?.value ?? '')
+        : dateFormatter.format(item.transactionDate);
+    if (!totals.has(key)) continue;
+    totals.set(key, totals.get(key)!.add(item.amount));
+  }
+
+  return [...labels.entries()].map(([key, label]) => ({
+    key,
+    label,
+    total: money(totals.get(key) ?? 0),
+  }));
+}
+
 @Injectable()
 export class DashboardService {
   constructor(
@@ -19,11 +87,9 @@ export class DashboardService {
   ) {}
 
   async get(userId: string, query: DashboardQueryDto) {
-    const user = await this.prisma.user.findUniqueOrThrow({
-      where: { id: userId },
-    });
+    await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
     const { referenceMonth, year, month } = parseReferenceMonth(query.month);
-    const { start, end } = getMonthRange(referenceMonth, user.timezone);
+    const { start, end } = getMonthRange(referenceMonth, BRAZIL_TIMEZONE);
     const [budget, transactions, connections] = await Promise.all([
       this.budgetsService.get(userId, referenceMonth),
       this.prisma.transaction.findMany({
@@ -58,37 +124,25 @@ export class DashboardService {
       ),
     );
     const now = new Date();
-    const currentMonth = now.toLocaleDateString('en-CA', {
-      timeZone: user.timezone,
-      year: 'numeric',
-      month: '2-digit',
-    });
     const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
     const currentDay = Number(
       now.toLocaleDateString('en-US', {
-        timeZone: user.timezone,
+        timeZone: BRAZIL_TIMEZONE,
         day: 'numeric',
       }),
     );
-    const isCurrentMonth = referenceMonth === currentMonth;
-    const elapsedDays = isCurrentMonth ? currentDay : daysInMonth;
-    const remainingDays = isCurrentMonth ? daysInMonth - currentDay + 1 : 1;
     const summary = calculateBudgetSummary({
       limit: budget.totalLimit === null ? null : Number(budget.totalLimit),
       realized: realized.toNumber(),
       pending: pending.toNumber(),
       income: income.toNumber(),
-      elapsedDays,
-      daysInMonth,
-      remainingDays,
-      isCurrentMonth,
     });
     const periodRange = this.getPeriodRange(
       query.period,
       query.anchor ??
         `${referenceMonth}-${String(Math.min(currentDay, daysInMonth)).padStart(2, '0')}`,
       referenceMonth,
-      user.timezone,
+      BRAZIL_TIMEZONE,
     );
     const periodTransactions = transactions.filter(
       (item) =>
@@ -127,13 +181,11 @@ export class DashboardService {
         committed: summary.committed.toFixed(2),
         income: summary.income.toFixed(2),
         available: summary.available?.toFixed(2) ?? null,
-        projection: summary.projection.toFixed(2),
-        dailySuggestion: summary.dailySuggestion?.toFixed(2) ?? null,
       },
-      timeline: this.buildTimeline(
+      timeline: buildDashboardTimeline(
         periodTransactions,
         query.period,
-        user.timezone,
+        periodRange,
       ),
       categories: [...categoryTotals.entries()]
         .map(([id, item]) => ({
@@ -210,39 +262,5 @@ export class DashboardService {
         timezone,
       ),
     };
-  }
-
-  private buildTimeline(
-    transactions: {
-      transactionDate: Date;
-      type: TransactionType;
-      amount: Prisma.Decimal;
-      excludedFromBudget: boolean;
-    }[],
-    period: DashboardQueryDto['period'],
-    timezone: string,
-  ) {
-    const totals = new Map<string, Prisma.Decimal>();
-    const formatter = new Intl.DateTimeFormat('pt-BR', {
-      timeZone: timezone,
-      ...(period === 'day'
-        ? { hour: '2-digit' }
-        : period === 'week'
-          ? { weekday: 'short' }
-          : { day: '2-digit' }),
-    });
-    for (const item of transactions) {
-      if (item.type !== TransactionType.EXPENSE || item.excludedFromBudget)
-        continue;
-      const key = formatter.format(item.transactionDate);
-      totals.set(
-        key,
-        (totals.get(key) ?? new Prisma.Decimal(0)).add(item.amount),
-      );
-    }
-    return [...totals.entries()].map(([label, total]) => ({
-      label,
-      total: money(total),
-    }));
   }
 }

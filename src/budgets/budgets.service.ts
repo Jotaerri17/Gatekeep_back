@@ -1,6 +1,8 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { CategoryType, Prisma } from '@prisma/client';
 import {
+  BRAZIL_TIMEZONE,
+  currentReferenceMonth,
   getMonthRange,
   money,
   parseMoney,
@@ -18,7 +20,7 @@ export class BudgetsService {
       where: { id: userId },
     });
     const { referenceMonth } = parseReferenceMonth(month);
-    const { snapshotDate } = getMonthRange(referenceMonth, user.timezone);
+    const { snapshotDate } = getMonthRange(referenceMonth, BRAZIL_TIMEZONE);
     let budget = await this.findBudget(userId, snapshotDate);
 
     if (!budget && user.defaultMonthlyLimit) {
@@ -58,11 +60,9 @@ export class BudgetsService {
   }
 
   async update(userId: string, month: string, dto: UpdateBudgetDto) {
-    const user = await this.prisma.user.findUniqueOrThrow({
-      where: { id: userId },
-    });
+    await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
     const { referenceMonth } = parseReferenceMonth(month);
-    const { snapshotDate } = getMonthRange(referenceMonth, user.timezone);
+    const { snapshotDate } = getMonthRange(referenceMonth, BRAZIL_TIMEZONE);
     const totalLimit = parseMoney(dto.totalLimit, 'totalLimit');
     const uniqueCategoryIds = new Set(
       dto.categoryBudgets.map((item) => item.categoryId),
@@ -104,7 +104,7 @@ export class BudgetsService {
         });
       }
 
-      const currentMonth = new Date().toISOString().slice(0, 7);
+      const currentMonth = currentReferenceMonth();
       if (referenceMonth === currentMonth) {
         await tx.user.update({
           where: { id: userId },

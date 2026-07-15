@@ -1,8 +1,27 @@
 import { BadRequestException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 
+export const BRAZIL_TIMEZONE = 'America/Sao_Paulo';
+
+export function currentReferenceMonth(
+  date = new Date(),
+  timezone = BRAZIL_TIMEZONE,
+) {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+    })
+      .formatToParts(date)
+      .filter((part) => part.type !== 'literal')
+      .map((part) => [part.type, part.value]),
+  );
+  return `${parts.year}-${parts.month}`;
+}
+
 export function parseReferenceMonth(value?: string) {
-  const fallback = new Date().toISOString().slice(0, 7);
+  const fallback = currentReferenceMonth();
   const referenceMonth = value ?? fallback;
 
   if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(referenceMonth)) {

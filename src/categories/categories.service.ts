@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import {
+  BRAZIL_TIMEZONE,
   getMonthRange,
   money,
   parseMoney,
@@ -19,13 +20,11 @@ export class CategoriesService {
   constructor(private readonly prisma: PrismaService) {}
 
   async list(userId: string, month?: string) {
-    const user = await this.prisma.user.findUniqueOrThrow({
-      where: { id: userId },
-    });
+    await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
     const { referenceMonth } = parseReferenceMonth(month);
     const { start, end, snapshotDate } = getMonthRange(
       referenceMonth,
-      user.timezone,
+      BRAZIL_TIMEZONE,
     );
 
     const [categories, totals, budget] = await Promise.all([

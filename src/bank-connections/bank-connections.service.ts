@@ -17,6 +17,7 @@ import {
   TransactionType,
   WebhookEventStatus,
 } from '@prisma/client';
+import { waitUntil } from '@vercel/functions';
 import { timingSafeEqual } from 'node:crypto';
 import { money } from '../finance/finance.utils';
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
@@ -159,6 +160,7 @@ export class BankConnectionsService {
   async sync(userId: string, id: string) {
     const connection = await this.findOwned(userId, id);
     await this.syncItem(userId, connection.externalItemId);
+    this.scheduleBackground(() => this.processPendingWebhooks());
     return { synced: true, syncedAt: new Date() };
   }
 
@@ -238,15 +240,28 @@ export class BankConnectionsService {
         error instanceof Prisma.PrismaClientKnownRequestError &&
         error.code === 'P2002'
       ) {
+        this.scheduleWebhookProcessing(externalId);
         return { accepted: true, duplicate: true };
       }
       throw error;
     }
-    setImmediate(() => void this.processWebhook(externalId));
+    this.scheduleWebhookProcessing(externalId);
     return { accepted: true, duplicate: false };
   }
 
   async processPendingWebhooks() {
+    const staleProcessingThreshold = new Date(Date.now() - 10 * 60 * 1000);
+    await this.prisma.webhookEvent.updateMany({
+      where: {
+        status: WebhookEventStatus.PROCESSING,
+        updatedAt: { lt: staleProcessingThreshold },
+      },
+      data: {
+        status: WebhookEventStatus.FAILED,
+        lastError: 'Processing timed out before completion',
+      },
+    });
+
     const events = await this.prisma.webhookEvent.findMany({
       where: {
         status: { in: [WebhookEventStatus.PENDING, WebhookEventStatus.FAILED] },
@@ -257,20 +272,36 @@ export class BankConnectionsService {
     await Promise.all(
       events.map((event) => this.processWebhook(event.externalId)),
     );
+    return { processed: events.length };
+  }
+
+  async recoverPendingWebhooks(authorization: string | undefined) {
+    const received = authorization?.startsWith('Bearer ')
+      ? authorization.slice('Bearer '.length).trim()
+      : undefined;
+    this.assertSecret(process.env.CRON_SECRET, received, 'Invalid cron secret');
+    return this.processPendingWebhooks();
   }
 
   private async processWebhook(externalId: string) {
-    const event = await this.prisma.webhookEvent.findUnique({
-      where: { externalId },
-    });
-    if (!event || event.status === WebhookEventStatus.PROCESSED) return;
-    await this.prisma.webhookEvent.update({
-      where: { externalId },
+    const claim = await this.prisma.webhookEvent.updateMany({
+      where: {
+        externalId,
+        status: {
+          in: [WebhookEventStatus.PENDING, WebhookEventStatus.FAILED],
+        },
+      },
       data: {
         status: WebhookEventStatus.PROCESSING,
         attempts: { increment: 1 },
       },
     });
+    if (claim.count === 0) return;
+
+    const event = await this.prisma.webhookEvent.findUnique({
+      where: { externalId },
+    });
+    if (!event) return;
     const payload = event.payload as PluggyWebhook;
     try {
       if (event.event === 'item/deleted' && payload.itemId) {
@@ -465,12 +496,12 @@ export class BankConnectionsService {
       [/restaurant|food|mercado|aliment|grocer/, 'Alimentação'],
       [/transport|gas station|fuel|uber|taxi/, 'Transporte'],
       [/health|medical|pharma|saúde/, 'Saúde'],
-      [/education|school|book|educa/, 'Educação'],
+      [/education|school|book|educa/, 'Outros'],
       [/stream|subscription|assinatura/, 'Assinaturas'],
       [/rent|house|utilities|moradia|home/, 'Moradia'],
-      [/tax|fee|imposto|taxa/, 'Impostos e Taxas'],
+      [/tax|fee|imposto|taxa/, 'Outros'],
       [/shop|retail|compra/, 'Compras'],
-      [/entertainment|leisure|lazer/, 'Lazer'],
+      [/entertainment|leisure|lazer/, 'Outros'],
     ];
     const target = mapping.find(([pattern]) => pattern.test(name))?.[1];
     if (!target) return undefined;
@@ -648,16 +679,47 @@ export class BankConnectionsService {
   }
 
   private assertWebhookSecret(received: string | undefined) {
-    const expected = process.env.PLUGGY_WEBHOOK_SECRET;
-    if (!expected || !received)
-      throw new UnauthorizedException('Invalid webhook secret');
+    this.assertSecret(
+      process.env.PLUGGY_WEBHOOK_SECRET,
+      received,
+      'Invalid webhook secret',
+    );
+  }
+
+  private assertSecret(
+    expected: string | undefined,
+    received: string | undefined,
+    message: string,
+  ) {
+    if (!expected || !received) throw new UnauthorizedException(message);
     const expectedBuffer = Buffer.from(expected);
     const receivedBuffer = Buffer.from(received);
     if (
       expectedBuffer.length !== receivedBuffer.length ||
       !timingSafeEqual(expectedBuffer, receivedBuffer)
     ) {
-      throw new UnauthorizedException('Invalid webhook secret');
+      throw new UnauthorizedException(message);
+    }
+  }
+
+  private scheduleWebhookProcessing(externalId: string) {
+    this.scheduleBackground(async () => {
+      await this.processWebhook(externalId);
+      await this.processPendingWebhooks();
+    });
+  }
+
+  private scheduleBackground(task: () => Promise<unknown>) {
+    if (process.env.NODE_ENV === 'test') return;
+    const backgroundTask = task().catch((error: unknown) => {
+      this.logger.error(
+        'Background webhook processing failed',
+        error instanceof Error ? error.stack : undefined,
+      );
+    });
+
+    if (process.env.VERCEL) {
+      waitUntil(backgroundTask);
     }
   }
 

@@ -1,0 +1,9 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "crons": [
+    {
+      "path": "/internal/webhooks/process-pending",
+      "schedule": "0 3 * * *"
+    }
+  ]
+}
