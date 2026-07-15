@@ -13,6 +13,7 @@ import { CurrentUser } from '../auth/current-user.decorator';
 import { Public } from '../auth/public.decorator';
 import { BankConnectionsService } from './bank-connections.service';
 import { CompleteConnectionDto } from './dto/complete-connection.dto';
+import { ConnectionAttemptErrorDto } from './dto/connection-attempt-error.dto';
 import { ConnectTokenDto } from './dto/connect-token.dto';
 
 @Controller()
@@ -34,6 +35,17 @@ export class BankConnectionsController {
     return this.bankConnectionsService.createConnectToken(
       user.id,
       dto.connectionId,
+    );
+  }
+
+  @Post('integrations/pluggy/connection-attempts/error')
+  connectionAttemptError(
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() dto: ConnectionAttemptErrorDto,
+  ) {
+    return this.bankConnectionsService.reportConnectionAttemptError(
+      user.id,
+      dto,
     );
   }
 

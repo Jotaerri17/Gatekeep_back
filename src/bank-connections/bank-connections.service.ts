@@ -18,7 +18,7 @@ import {
   WebhookEventStatus,
 } from '@prisma/client';
 import { waitUntil } from '@vercel/functions';
-import { timingSafeEqual } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { money } from '../finance/finance.utils';
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
 
@@ -130,7 +130,71 @@ export class BankConnectionsService {
     );
     if (!token.accessToken)
       throw new BadGatewayException('Pluggy did not return a connect token');
-    return { accessToken: token.accessToken, connectorId };
+    const attemptId = randomUUID();
+    this.logger.log(
+      JSON.stringify({
+        event: 'pluggy_connection_attempt_started',
+        attemptId,
+        userId,
+        reconnect: Boolean(connectionId),
+      }),
+    );
+    return { accessToken: token.accessToken, connectorId, attemptId };
+  }
+
+  async reportConnectionAttemptError(
+    userId: string,
+    input: {
+      attemptId: string;
+      code: string;
+      message: string;
+      itemId?: string;
+      occurredAt: string;
+    },
+  ) {
+    let connectionPreserved = false;
+
+    if (input.itemId) {
+      const item = await this.pluggyRequest<PluggyItem>(
+        `/items/${input.itemId}`,
+      );
+      if (item.clientUserId !== userId) {
+        throw new UnauthorizedException(
+          'This bank connection belongs to another user',
+        );
+      }
+      const existing = await this.prisma.bankConnection.findUnique({
+        where: { externalItemId: input.itemId },
+      });
+      if (existing && existing.userId !== userId) {
+        throw new UnauthorizedException(
+          'This bank connection belongs to another user',
+        );
+      }
+      const connection = await this.upsertConnection(userId, item);
+      await this.prisma.bankConnection.update({
+        where: { id: connection.id },
+        data: {
+          status: BankConnectionStatus.ERROR,
+          errorCode: input.code,
+        },
+      });
+      connectionPreserved = true;
+    }
+
+    this.logger.warn(
+      JSON.stringify({
+        event: 'pluggy_connection_attempt_error',
+        attemptId: input.attemptId,
+        userId,
+        code: input.code,
+        itemId: input.itemId ?? null,
+        occurredAt: input.occurredAt,
+        connectionPreserved,
+      }),
+    );
+
+    return { accepted: true as const };
   }
 
   async completeConnection(userId: string, itemId: string) {
@@ -577,7 +641,10 @@ export class BankConnectionsService {
       throw new NotFoundException('Pluggy resource not found');
     if (!response.ok) {
       const payload = await this.readPluggyError(response);
-      if (payload.code === 'ITEM_USER_ALREADY_EXISTS') {
+      if (
+        payload.code === 'ITEM_USER_ALREADY_EXISTS' ||
+        payload.code === 'ITEM_USER_ALREADY_EXIST'
+      ) {
         throw new BadRequestException(
           'Este banco já foi compartilhado com o Gatekeep. No Meu Pluggy, revogue o acesso do Gatekeep para este banco e tente novamente. Sua conexão original continuará ativa.',
         );

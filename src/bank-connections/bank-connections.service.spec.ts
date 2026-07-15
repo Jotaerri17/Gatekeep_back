@@ -22,6 +22,8 @@ describe('BankConnectionsService', () => {
   const prisma = {
     bankConnection: {
       findFirst: jest.fn(),
+      findUnique: jest.fn(),
+      upsert: jest.fn(),
       update: jest.fn(),
       updateMany: jest.fn(),
     },
@@ -78,6 +80,9 @@ describe('BankConnectionsService', () => {
     await expect(service.createConnectToken('user-id')).resolves.toEqual({
       accessToken: 'connect-token',
       connectorId: 42,
+      attemptId: expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      ) as string,
     });
 
     const connectRequest = fetchMock.mock.calls[2];
@@ -94,7 +99,73 @@ describe('BankConnectionsService', () => {
     });
   });
 
-  it('explains how to recover when Pluggy finds an existing shared bank', async () => {
+  it.each(['ITEM_USER_ALREADY_EXISTS', 'ITEM_USER_ALREADY_EXIST'])(
+    'explains how to recover when Pluggy returns %s',
+    async (code) => {
+      fetchMock
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ apiKey: 'api-key' }), { status: 200 }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              results: [{ id: 42, name: 'Meu Pluggy' }],
+            }),
+            { status: 200 },
+          ),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ code }), {
+            status: 400,
+          }),
+        );
+
+      await expect(service.createConnectToken('user-id')).rejects.toThrow(
+        'No Meu Pluggy, revogue o acesso do Gatekeep para este banco',
+      );
+    },
+  );
+
+  it('records a connection attempt error without persisting sensitive data', async () => {
+    await expect(
+      service.reportConnectionAttemptError('user-id', {
+        attemptId: 'f3696b1c-a228-43ad-a86c-841b50ab214b',
+        code: 'ITEM_USER_ALREADY_EXISTS',
+        message: 'duplicate',
+        occurredAt: '2026-07-15T20:00:00.000Z',
+      }),
+    ).resolves.toEqual({ accepted: true });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(prisma.bankConnection.upsert).not.toHaveBeenCalled();
+  });
+
+  it('rejects an error item that belongs to another user', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ apiKey: 'api-key' }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ id: 'item-id', clientUserId: 'other-user' }),
+          { status: 200 },
+        ),
+      );
+
+    await expect(
+      service.reportConnectionAttemptError('user-id', {
+        attemptId: 'f3696b1c-a228-43ad-a86c-841b50ab214b',
+        code: 'UNKNOWN',
+        message: 'failed',
+        itemId: '6d702702-7f0a-43c2-a808-6dc742685840',
+        occurredAt: '2026-07-15T20:00:00.000Z',
+      }),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
+
+    expect(prisma.bankConnection.upsert).not.toHaveBeenCalled();
+  });
+
+  it('preserves an owned item in error state for reconnection', async () => {
     fetchMock
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ apiKey: 'api-key' }), { status: 200 }),
@@ -102,20 +173,35 @@ describe('BankConnectionsService', () => {
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
-            results: [{ id: 42, name: 'Meu Pluggy' }],
+            id: '6d702702-7f0a-43c2-a808-6dc742685840',
+            clientUserId: 'user-id',
+            connector: { id: 200, name: 'MeuPluggy' },
+            status: 'ERROR',
           }),
           { status: 200 },
         ),
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ code: 'ITEM_USER_ALREADY_EXISTS' }), {
-          status: 400,
-        }),
       );
+    prisma.bankConnection.findUnique.mockResolvedValue(null);
+    prisma.bankConnection.upsert.mockResolvedValue({ id: 'connection-id' });
+    prisma.bankConnection.update.mockResolvedValue({});
 
-    await expect(service.createConnectToken('user-id')).rejects.toThrow(
-      'No Meu Pluggy, revogue o acesso do Gatekeep para este banco',
-    );
+    await expect(
+      service.reportConnectionAttemptError('user-id', {
+        attemptId: 'f3696b1c-a228-43ad-a86c-841b50ab214b',
+        code: 'UNKNOWN',
+        message: 'failed',
+        itemId: '6d702702-7f0a-43c2-a808-6dc742685840',
+        occurredAt: '2026-07-15T20:00:00.000Z',
+      }),
+    ).resolves.toEqual({ accepted: true });
+
+    expect(prisma.bankConnection.update).toHaveBeenCalledWith({
+      where: { id: 'connection-id' },
+      data: {
+        status: BankConnectionStatus.ERROR,
+        errorCode: 'UNKNOWN',
+      },
+    });
   });
 
   it('marks a connection as disconnected when Meu Pluggy revokes it', async () => {
