@@ -579,7 +579,7 @@ export class BankConnectionsService {
       const payload = await this.readPluggyError(response);
       if (payload.code === 'ITEM_USER_ALREADY_EXISTS') {
         throw new BadRequestException(
-          'Este banco já está conectado ao seu Gatekeep.',
+          'Este banco já foi compartilhado com o Gatekeep. No Meu Pluggy, revogue o acesso do Gatekeep para este banco e tente novamente. Sua conexão original continuará ativa.',
         );
       }
       if (payload.code === 'TRIAL_CLIENT_ITEM_CREATE_NOT_ALLOWED') {

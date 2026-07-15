@@ -94,6 +94,30 @@ describe('BankConnectionsService', () => {
     });
   });
 
+  it('explains how to recover when Pluggy finds an existing shared bank', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ apiKey: 'api-key' }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            results: [{ id: 42, name: 'Meu Pluggy' }],
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ code: 'ITEM_USER_ALREADY_EXISTS' }), {
+          status: 400,
+        }),
+      );
+
+    await expect(service.createConnectToken('user-id')).rejects.toThrow(
+      'No Meu Pluggy, revogue o acesso do Gatekeep para este banco',
+    );
+  });
+
   it('marks a connection as disconnected when Meu Pluggy revokes it', async () => {
     prisma.webhookEvent.findUnique.mockResolvedValue({
       externalId: 'event-id',
