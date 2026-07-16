@@ -1,7 +1,13 @@
-import { BadRequestException, UnauthorizedException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import {
   BankConnectionStatus,
   CategoryType,
+  PluggyConnectionAttemptStatus,
+  Prisma,
   TransactionSource,
   TransactionType,
   WebhookEventStatus,
@@ -11,12 +17,20 @@ import { BankConnectionsService } from './bank-connections.service';
 
 type PrivateBankConnectionsService = {
   processWebhook(externalId: string): Promise<void>;
+  syncItem(
+    userId: string,
+    itemId: string,
+    expectedClientUserId?: string,
+  ): Promise<void>;
   mapCategory(
     providerName: string,
     type: TransactionType,
     categories: { id: string; name: string; type: CategoryType }[],
   ): { id: string; name: string; type: CategoryType } | undefined;
 };
+
+const attemptId = 'f3696b1c-a228-43ad-a86c-841b50ab214b';
+const itemId = '6d702702-7f0a-43c2-a808-6dc742685840';
 
 describe('BankConnectionsService', () => {
   const prisma = {
@@ -28,8 +42,17 @@ describe('BankConnectionsService', () => {
       updateMany: jest.fn(),
     },
     bankAccount: {
+      findFirst: jest.fn(),
       findMany: jest.fn(),
       deleteMany: jest.fn(),
+      upsert: jest.fn(),
+    },
+    pluggyConnectionAttempt: {
+      create: jest.fn(),
+      findFirst: jest.fn(),
+      findUnique: jest.fn(),
+      update: jest.fn(),
+      updateMany: jest.fn(),
     },
     transaction: {
       deleteMany: jest.fn(),
@@ -53,6 +76,22 @@ describe('BankConnectionsService', () => {
     global.fetch = fetchMock;
     process.env.PLUGGY_CLIENT_ID = 'client-id';
     process.env.PLUGGY_CLIENT_SECRET = 'client-secret';
+    const pendingAttempt = {
+      id: attemptId,
+      userId: 'user-id',
+      bankConnectionId: null,
+      expectedItemId: null,
+      resultItemId: null,
+      status: PluggyConnectionAttemptStatus.PENDING,
+      expiresAt: new Date(Date.now() + 30 * 60 * 1000),
+      completedAt: null,
+      errorCode: null,
+    };
+    prisma.pluggyConnectionAttempt.create.mockResolvedValue(pendingAttempt);
+    prisma.pluggyConnectionAttempt.findFirst.mockResolvedValue(pendingAttempt);
+    prisma.pluggyConnectionAttempt.findUnique.mockResolvedValue(null);
+    prisma.pluggyConnectionAttempt.update.mockResolvedValue(pendingAttempt);
+    prisma.pluggyConnectionAttempt.updateMany.mockResolvedValue({ count: 1 });
   });
 
   it('creates a token restricted to the MeuPluggy connector', async () => {
@@ -80,9 +119,17 @@ describe('BankConnectionsService', () => {
     await expect(service.createConnectToken('user-id')).resolves.toEqual({
       accessToken: 'connect-token',
       connectorId: 42,
-      attemptId: expect.stringMatching(
-        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-      ) as string,
+      attemptId,
+      mode: 'CREATE',
+    });
+
+    expect(prisma.pluggyConnectionAttempt.create).toHaveBeenCalledWith({
+      data: {
+        userId: 'user-id',
+        bankConnectionId: undefined,
+        expectedItemId: undefined,
+        expiresAt: expect.any(Date) as Date,
+      },
     });
 
     const connectRequest = fetchMock.mock.calls[2];
@@ -93,10 +140,105 @@ describe('BankConnectionsService', () => {
     const parsedBody: unknown = JSON.parse(requestBody);
     expect(parsedBody).toEqual({
       options: {
-        clientUserId: 'user-id',
+        clientUserId: attemptId,
         avoidDuplicates: true,
       },
     });
+  });
+
+  it('creates an update token without replacing the Item client user reference', async () => {
+    const connectionId = 'connection-id';
+    prisma.bankConnection.findFirst.mockResolvedValue({
+      id: connectionId,
+      userId: 'user-id',
+      externalItemId: itemId,
+    });
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ apiKey: 'api-key' }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ results: [{ id: 42, name: 'Meu Pluggy' }] }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ accessToken: 'update-token' }), {
+          status: 200,
+        }),
+      );
+
+    await expect(
+      service.createConnectToken('user-id', connectionId),
+    ).resolves.toEqual({
+      accessToken: 'update-token',
+      connectorId: 42,
+      attemptId,
+      mode: 'UPDATE',
+      updateItemId: itemId,
+    });
+
+    expect(prisma.pluggyConnectionAttempt.create).toHaveBeenCalledWith({
+      data: {
+        userId: 'user-id',
+        bankConnectionId: connectionId,
+        expectedItemId: itemId,
+        expiresAt: expect.any(Date) as Date,
+      },
+    });
+    expect(JSON.parse(fetchMock.mock.calls[2][1]?.body as string)).toEqual({
+      options: { avoidDuplicates: true },
+      itemId,
+    });
+  });
+
+  it('creates isolated token references for different users', async () => {
+    const secondAttemptId = '4e850c43-fb04-4bd0-8a84-fba6c0bb064b';
+    prisma.pluggyConnectionAttempt.create
+      .mockResolvedValueOnce({ id: attemptId })
+      .mockResolvedValueOnce({ id: secondAttemptId });
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ apiKey: 'api-key' }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ results: [{ id: 42, name: 'Meu Pluggy' }] }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ accessToken: 'token-a' }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ accessToken: 'token-b' }), {
+          status: 200,
+        }),
+      );
+
+    await expect(service.createConnectToken('user-a')).resolves.toMatchObject({
+      accessToken: 'token-a',
+      attemptId,
+    });
+    await expect(service.createConnectToken('user-b')).resolves.toMatchObject({
+      accessToken: 'token-b',
+      attemptId: secondAttemptId,
+    });
+
+    const firstBody = JSON.parse(
+      fetchMock.mock.calls[2][1]?.body as string,
+    ) as { options: { clientUserId: string } };
+    const secondBody = JSON.parse(
+      fetchMock.mock.calls[3][1]?.body as string,
+    ) as { options: { clientUserId: string } };
+    expect(firstBody.options.clientUserId).toBe(attemptId);
+    expect(secondBody.options.clientUserId).toBe(secondAttemptId);
+    expect(firstBody.options.clientUserId).not.toBe(
+      secondBody.options.clientUserId,
+    );
   });
 
   it.each(['ITEM_USER_ALREADY_EXISTS', 'ITEM_USER_ALREADY_EXIST'])(
@@ -121,7 +263,7 @@ describe('BankConnectionsService', () => {
         );
 
       await expect(service.createConnectToken('user-id')).rejects.toThrow(
-        'No Meu Pluggy, revogue o acesso do Gatekeep para este banco',
+        'estas credenciais já possuem uma conexão ativa',
       );
     },
   );
@@ -129,7 +271,7 @@ describe('BankConnectionsService', () => {
   it('records a connection attempt error without persisting sensitive data', async () => {
     await expect(
       service.reportConnectionAttemptError('user-id', {
-        attemptId: 'f3696b1c-a228-43ad-a86c-841b50ab214b',
+        attemptId,
         code: 'ITEM_USER_ALREADY_EXISTS',
         message: 'duplicate',
         occurredAt: '2026-07-15T20:00:00.000Z',
@@ -138,6 +280,70 @@ describe('BankConnectionsService', () => {
 
     expect(fetchMock).not.toHaveBeenCalled();
     expect(prisma.bankConnection.upsert).not.toHaveBeenCalled();
+    expect(prisma.pluggyConnectionAttempt.update).toHaveBeenCalledWith({
+      where: { id: attemptId },
+      data: {
+        bankConnectionId: null,
+        resultItemId: undefined,
+        status: PluggyConnectionAttemptStatus.FAILED,
+        errorCode: 'ITEM_USER_ALREADY_EXISTS',
+      },
+    });
+  });
+
+  it('accepts an authenticated webhook and queues it without sensitive data', async () => {
+    process.env.PLUGGY_WEBHOOK_SECRET = 'webhook-secret';
+    prisma.webhookEvent.create.mockResolvedValue({});
+
+    await expect(
+      service.enqueueWebhook('webhook-secret', {
+        event: 'item/created',
+        eventId: 'event-id',
+        itemId: 'item-id',
+        clientUserId: 'user-id',
+      }),
+    ).resolves.toEqual({ accepted: true, duplicate: false });
+
+    expect(prisma.webhookEvent.create).toHaveBeenCalledWith({
+      data: {
+        externalId: 'event-id',
+        event: 'item/created',
+        payload: {
+          event: 'item/created',
+          eventId: 'event-id',
+          itemId: 'item-id',
+          clientUserId: 'user-id',
+        },
+      },
+    });
+  });
+
+  it('rejects a webhook with an invalid secret', async () => {
+    process.env.PLUGGY_WEBHOOK_SECRET = 'webhook-secret';
+
+    await expect(
+      service.enqueueWebhook('wrong-secret', {
+        event: 'item/created',
+        eventId: 'event-id',
+      }),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
+  });
+
+  it('accepts a repeated webhook event idempotently', async () => {
+    process.env.PLUGGY_WEBHOOK_SECRET = 'webhook-secret';
+    prisma.webhookEvent.create.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('duplicate', {
+        code: 'P2002',
+        clientVersion: '7.8.0',
+      }),
+    );
+
+    await expect(
+      service.enqueueWebhook('webhook-secret', {
+        event: 'item/created',
+        eventId: 'event-id',
+      }),
+    ).resolves.toEqual({ accepted: true, duplicate: true });
   });
 
   it('rejects an error item that belongs to another user', async () => {
@@ -154,10 +360,10 @@ describe('BankConnectionsService', () => {
 
     await expect(
       service.reportConnectionAttemptError('user-id', {
-        attemptId: 'f3696b1c-a228-43ad-a86c-841b50ab214b',
+        attemptId,
         code: 'UNKNOWN',
         message: 'failed',
-        itemId: '6d702702-7f0a-43c2-a808-6dc742685840',
+        itemId,
         occurredAt: '2026-07-15T20:00:00.000Z',
       }),
     ).rejects.toBeInstanceOf(UnauthorizedException);
@@ -173,8 +379,8 @@ describe('BankConnectionsService', () => {
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
-            id: '6d702702-7f0a-43c2-a808-6dc742685840',
-            clientUserId: 'user-id',
+            id: itemId,
+            clientUserId: attemptId,
             connector: { id: 200, name: 'MeuPluggy' },
             status: 'ERROR',
           }),
@@ -187,10 +393,10 @@ describe('BankConnectionsService', () => {
 
     await expect(
       service.reportConnectionAttemptError('user-id', {
-        attemptId: 'f3696b1c-a228-43ad-a86c-841b50ab214b',
+        attemptId,
         code: 'UNKNOWN',
         message: 'failed',
-        itemId: '6d702702-7f0a-43c2-a808-6dc742685840',
+        itemId,
         occurredAt: '2026-07-15T20:00:00.000Z',
       }),
     ).resolves.toEqual({ accepted: true });
@@ -202,6 +408,238 @@ describe('BankConnectionsService', () => {
         errorCode: 'UNKNOWN',
       },
     });
+  });
+
+  it('completes an item only through its authenticated attempt', async () => {
+    prisma.bankConnection.findUnique
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        id: 'connection-id',
+        userId: 'user-id',
+        externalItemId: itemId,
+        accounts: [],
+      });
+    prisma.bankConnection.upsert.mockResolvedValue({ id: 'connection-id' });
+    prisma.bankConnection.update.mockResolvedValue({});
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ apiKey: 'api-key' }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: itemId,
+            clientUserId: attemptId,
+            connector: { id: 200, name: 'MeuPluggy' },
+            executionStatus: 'SUCCESS',
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: itemId,
+            clientUserId: attemptId,
+            connector: { id: 200, name: 'MeuPluggy' },
+            executionStatus: 'SUCCESS',
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ results: [] }), { status: 200 }),
+      );
+
+    await expect(
+      service.completeConnection('user-id', attemptId, itemId),
+    ).resolves.toMatchObject({
+      id: 'connection-id',
+      userId: 'user-id',
+      accountCount: 0,
+    });
+
+    expect(prisma.pluggyConnectionAttempt.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: attemptId,
+        userId: 'user-id',
+        status: PluggyConnectionAttemptStatus.PENDING,
+        expiresAt: { gt: expect.any(Date) as Date },
+      },
+      data: {
+        status: PluggyConnectionAttemptStatus.PROCESSING,
+        resultItemId: itemId,
+      },
+    });
+    expect(prisma.pluggyConnectionAttempt.update).toHaveBeenLastCalledWith({
+      where: { id: attemptId },
+      data: {
+        bankConnectionId: 'connection-id',
+        resultItemId: itemId,
+        status: PluggyConnectionAttemptStatus.COMPLETED,
+        completedAt: expect.any(Date) as Date,
+        errorCode: null,
+      },
+    });
+  });
+
+  it('completes a reconnection through the owned expected Item without changing clientUserId', async () => {
+    const connection = {
+      id: 'connection-id',
+      userId: 'user-id',
+      externalItemId: itemId,
+    };
+    prisma.pluggyConnectionAttempt.findFirst.mockResolvedValue({
+      id: attemptId,
+      userId: 'user-id',
+      bankConnectionId: connection.id,
+      expectedItemId: itemId,
+      resultItemId: null,
+      status: PluggyConnectionAttemptStatus.PENDING,
+      expiresAt: new Date(Date.now() + 30 * 60 * 1000),
+    });
+    prisma.bankConnection.findFirst.mockResolvedValue(connection);
+    prisma.bankConnection.findUnique
+      .mockResolvedValueOnce(connection)
+      .mockResolvedValueOnce({ ...connection, accounts: [] });
+    prisma.bankConnection.upsert.mockResolvedValue(connection);
+    prisma.bankConnection.update.mockResolvedValue({});
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ apiKey: 'api-key' }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: itemId,
+            clientUserId: 'original-connection-reference',
+            connector: { id: 200, name: 'MeuPluggy' },
+            executionStatus: 'SUCCESS',
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: itemId,
+            clientUserId: 'original-connection-reference',
+            connector: { id: 200, name: 'MeuPluggy' },
+            executionStatus: 'SUCCESS',
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ results: [] }), { status: 200 }),
+      );
+
+    await expect(
+      service.completeConnection('user-id', attemptId, itemId),
+    ).resolves.toMatchObject({ id: connection.id, accountCount: 0 });
+
+    expect(prisma.bankConnection.findFirst).toHaveBeenCalledWith({
+      where: {
+        id: connection.id,
+        userId: 'user-id',
+        externalItemId: itemId,
+      },
+    });
+  });
+
+  it('returns an already completed callback idempotently', async () => {
+    prisma.pluggyConnectionAttempt.findFirst.mockResolvedValue({
+      id: attemptId,
+      userId: 'user-id',
+      bankConnectionId: 'connection-id',
+      expectedItemId: null,
+      resultItemId: itemId,
+      status: PluggyConnectionAttemptStatus.COMPLETED,
+      expiresAt: new Date(Date.now() + 30 * 60 * 1000),
+    });
+    prisma.bankConnection.findUnique.mockResolvedValue({
+      id: 'connection-id',
+      userId: 'user-id',
+      externalItemId: itemId,
+      accounts: [],
+    });
+
+    await expect(
+      service.completeConnection('user-id', attemptId, itemId),
+    ).resolves.toMatchObject({ id: 'connection-id', accountCount: 0 });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(prisma.bankConnection.upsert).not.toHaveBeenCalled();
+  });
+
+  it('does not expose another user connection attempt', async () => {
+    prisma.pluggyConnectionAttempt.findFirst.mockResolvedValue(null);
+
+    await expect(
+      service.completeConnection('user-b', attemptId, itemId),
+    ).rejects.toThrow('Connection attempt not found');
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(prisma.bankConnection.upsert).not.toHaveBeenCalled();
+    expect(prisma.pluggyConnectionAttempt.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('rejects an expired connection attempt before reading the item', async () => {
+    prisma.pluggyConnectionAttempt.findFirst.mockResolvedValue({
+      id: attemptId,
+      userId: 'user-id',
+      expectedItemId: null,
+      resultItemId: null,
+      status: PluggyConnectionAttemptStatus.PENDING,
+      expiresAt: new Date(Date.now() - 1000),
+    });
+
+    await expect(
+      service.completeConnection('user-id', attemptId, itemId),
+    ).rejects.toBeInstanceOf(BadRequestException);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(prisma.pluggyConnectionAttempt.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: attemptId,
+        status: PluggyConnectionAttemptStatus.PENDING,
+      },
+      data: { status: PluggyConnectionAttemptStatus.EXPIRED },
+    });
+  });
+
+  it('rejects an item without the attempt reference', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ apiKey: 'api-key' }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: itemId }), { status: 200 }),
+      );
+
+    await expect(
+      service.completeConnection('user-id', attemptId, itemId),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
+
+    expect(prisma.pluggyConnectionAttempt.updateMany).not.toHaveBeenCalled();
+    expect(prisma.bankConnection.upsert).not.toHaveBeenCalled();
+  });
+
+  it('rejects a different item during reconnection', async () => {
+    prisma.pluggyConnectionAttempt.findFirst.mockResolvedValue({
+      id: attemptId,
+      userId: 'user-id',
+      expectedItemId: '4e850c43-fb04-4bd0-8a84-fba6c0bb064b',
+      resultItemId: null,
+      status: PluggyConnectionAttemptStatus.PENDING,
+      expiresAt: new Date(Date.now() + 30 * 60 * 1000),
+    });
+
+    await expect(
+      service.completeConnection('user-id', attemptId, itemId),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
+
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('marks a connection as disconnected when Meu Pluggy revokes it', async () => {
@@ -232,6 +670,147 @@ describe('BankConnectionsService', () => {
         status: WebhookEventStatus.PROCESSED,
         processedAt: expect.any(Date) as Date,
         lastError: null,
+      },
+    });
+  });
+
+  it('persists an item error received only through a webhook', async () => {
+    prisma.webhookEvent.findUnique.mockResolvedValue({
+      externalId: 'event-id',
+      event: 'item/error',
+      status: WebhookEventStatus.PENDING,
+      payload: {
+        itemId,
+        clientUserId: attemptId,
+        error: { code: 'CONNECTION_ERROR' },
+      },
+    });
+    prisma.webhookEvent.updateMany.mockResolvedValue({ count: 1 });
+    prisma.bankConnection.findUnique.mockResolvedValue(null);
+    prisma.bankConnection.upsert.mockResolvedValue({ id: 'connection-id' });
+    prisma.bankConnection.update.mockResolvedValue({});
+    prisma.webhookEvent.update.mockResolvedValue({});
+    prisma.pluggyConnectionAttempt.findUnique.mockResolvedValue({
+      id: attemptId,
+      userId: 'user-id',
+      status: PluggyConnectionAttemptStatus.PENDING,
+      expiresAt: new Date(Date.now() + 30 * 60 * 1000),
+    });
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ apiKey: 'api-key' }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: itemId,
+            clientUserId: attemptId,
+            connector: { id: 200, name: 'MeuPluggy' },
+            status: 'OUTDATED',
+            executionStatus: 'CONNECTION_ERROR',
+            error: { code: 'CONNECTION_ERROR' },
+          }),
+          { status: 200 },
+        ),
+      );
+
+    await (service as unknown as PrivateBankConnectionsService).processWebhook(
+      'event-id',
+    );
+
+    expect(prisma.bankConnection.upsert).toHaveBeenCalled();
+    expect(prisma.bankConnection.update).toHaveBeenCalledWith({
+      where: { id: 'connection-id' },
+      data: {
+        status: BankConnectionStatus.ERROR,
+        errorCode: 'CONNECTION_ERROR',
+      },
+    });
+  });
+
+  it('does not create a connection from a webhook without a known attempt', async () => {
+    prisma.webhookEvent.findUnique.mockResolvedValue({
+      externalId: 'event-id',
+      event: 'item/created',
+      status: WebhookEventStatus.PENDING,
+      payload: { itemId, clientUserId: attemptId },
+    });
+    prisma.webhookEvent.updateMany.mockResolvedValue({ count: 1 });
+    prisma.webhookEvent.update.mockResolvedValue({});
+    prisma.bankConnection.findUnique.mockResolvedValue(null);
+    prisma.pluggyConnectionAttempt.findUnique.mockResolvedValue(null);
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ apiKey: 'api-key' }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: itemId, clientUserId: attemptId }), {
+          status: 200,
+        }),
+      );
+
+    await (service as unknown as PrivateBankConnectionsService).processWebhook(
+      'event-id',
+    );
+
+    expect(prisma.bankConnection.upsert).not.toHaveBeenCalled();
+    expect(prisma.webhookEvent.update).toHaveBeenLastCalledWith({
+      where: { externalId: 'event-id' },
+      data: {
+        status: WebhookEventStatus.PROCESSED,
+        processedAt: expect.any(Date) as Date,
+        lastError: null,
+      },
+    });
+  });
+
+  it('does not move an account already imported by another user', async () => {
+    prisma.bankConnection.upsert.mockResolvedValue({ id: 'new-connection' });
+    prisma.bankAccount.findFirst.mockResolvedValue({
+      id: 'existing-account',
+      userId: 'other-user',
+      bankConnectionId: 'existing-connection',
+    });
+    prisma.bankConnection.update.mockResolvedValue({});
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ apiKey: 'api-key' }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: 'item-id',
+            clientUserId: attemptId,
+            connector: { id: 200, name: 'MeuPluggy' },
+            status: 'UPDATED',
+            executionStatus: 'SUCCESS',
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            results: [{ id: 'account-id', name: 'Conta Corrente' }],
+          }),
+          { status: 200 },
+        ),
+      );
+
+    await expect(
+      (service as unknown as PrivateBankConnectionsService).syncItem(
+        'user-id',
+        'item-id',
+        attemptId,
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+
+    expect(prisma.bankAccount.upsert).not.toHaveBeenCalled();
+    expect(prisma.bankConnection.update).toHaveBeenCalledWith({
+      where: { id: 'new-connection' },
+      data: {
+        status: BankConnectionStatus.ERROR,
+        errorCode: 'DUPLICATE_BANK_ACCOUNT',
       },
     });
   });

@@ -50,20 +50,29 @@ enum WebhookEventStatus {
   FAILED
 }
 
+enum PluggyConnectionAttemptStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  EXPIRED
+}
+
 model User {
-  id                  String           @id @db.Uuid
-  email               String           @unique
-  fullName            String?
-  currency            String           @default("BRL")
-  timezone            String           @default("America/Sao_Paulo")
-  defaultMonthlyLimit Decimal?         @db.Decimal(14, 2)
-  categories          Category[]
-  transactions        Transaction[]
-  monthlyBudgets      MonthlyBudget[]
-  bankConnections     BankConnection[]
-  bankAccounts        BankAccount[]
-  createdAt           DateTime         @default(now())
-  updatedAt           DateTime         @updatedAt
+  id                       String                    @id @db.Uuid
+  email                    String                    @unique
+  fullName                 String?
+  currency                 String                    @default("BRL")
+  timezone                 String                    @default("America/Sao_Paulo")
+  defaultMonthlyLimit      Decimal?                  @db.Decimal(14, 2)
+  categories               Category[]
+  transactions             Transaction[]
+  monthlyBudgets           MonthlyBudget[]
+  bankConnections          BankConnection[]
+  pluggyConnectionAttempts PluggyConnectionAttempt[]
+  bankAccounts             BankAccount[]
+  createdAt                DateTime                  @default(now())
+  updatedAt                DateTime                  @updatedAt
 
   @@map("Users")
 }
@@ -151,24 +160,46 @@ model CategoryBudget {
 }
 
 model BankConnection {
-  id                 String               @id @default(uuid()) @db.Uuid
-  userId             String               @db.Uuid
-  provider           String               @default("PLUGGY")
-  externalItemId     String               @unique
+  id                 String                    @id @default(uuid()) @db.Uuid
+  userId             String                    @db.Uuid
+  provider           String                    @default("PLUGGY")
+  externalItemId     String                    @unique
   connectorId        Int?
   institutionName    String?
   institutionLogoUrl String?
-  status             BankConnectionStatus @default(CONNECTING)
+  status             BankConnectionStatus      @default(CONNECTING)
   lastSyncedAt       DateTime?
   errorCode          String?
   consentExpiresAt   DateTime?
-  user               User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user               User                      @relation(fields: [userId], references: [id], onDelete: Cascade)
   accounts           BankAccount[]
-  createdAt          DateTime             @default(now())
-  updatedAt          DateTime             @updatedAt
+  attempts           PluggyConnectionAttempt[]
+  createdAt          DateTime                  @default(now())
+  updatedAt          DateTime                  @updatedAt
 
   @@index([userId, status])
   @@map("bank_connections")
+}
+
+model PluggyConnectionAttempt {
+  id               String                        @id @default(uuid()) @db.Uuid
+  userId           String                        @db.Uuid
+  bankConnectionId String?                       @db.Uuid
+  expectedItemId   String?
+  resultItemId     String?
+  status           PluggyConnectionAttemptStatus @default(PENDING)
+  expiresAt        DateTime
+  completedAt      DateTime?
+  errorCode        String?
+  user             User                          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bankConnection   BankConnection?               @relation(fields: [bankConnectionId], references: [id], onDelete: SetNull)
+  createdAt        DateTime                      @default(now())
+  updatedAt        DateTime                      @updatedAt
+
+  @@index([userId, status, expiresAt])
+  @@index([resultItemId])
+  @@index([bankConnectionId])
+  @@map("pluggy_connection_attempts")
 }
 
 model BankAccount {

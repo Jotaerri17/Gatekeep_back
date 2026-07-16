@@ -1,6 +1,7 @@
 import {
   BadGatewayException,
   BadRequestException,
+  ConflictException,
   Injectable,
   Logger,
   NotFoundException,
@@ -11,6 +12,7 @@ import {
   BankConnectionStatus,
   CategoryType,
   ExpenseNature,
+  PluggyConnectionAttemptStatus,
   Prisma,
   TransactionSource,
   TransactionStatus,
@@ -18,7 +20,7 @@ import {
   WebhookEventStatus,
 } from '@prisma/client';
 import { waitUntil } from '@vercel/functions';
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { timingSafeEqual } from 'node:crypto';
 import { money } from '../finance/finance.utils';
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
 
@@ -28,7 +30,7 @@ type PluggyItem = {
   status?: string;
   executionStatus?: string;
   lastUpdatedAt?: string;
-  error?: { code?: string } | null;
+  error?: { code?: string; message?: string } | null;
   connector?: {
     id?: number;
     name?: string;
@@ -80,6 +82,7 @@ type PluggyWebhook = {
 export class BankConnectionsService {
   private static readonly meuPluggyProvider = 'MEU_PLUGGY';
   private static readonly connectorCacheTtlMs = 6 * 60 * 60 * 1000;
+  private static readonly connectTokenTtlMs = 30 * 60 * 1000;
   private readonly apiUrl =
     process.env.PLUGGY_API_URL ?? 'https://api.pluggy.ai';
   private readonly logger = new Logger(BankConnectionsService.name);
@@ -111,35 +114,68 @@ export class BankConnectionsService {
 
   async createConnectToken(userId: string, connectionId?: string) {
     let itemId: string | undefined;
+    let bankConnectionId: string | undefined;
     if (connectionId) {
       const connection = await this.findOwned(userId, connectionId);
       itemId = connection.externalItemId;
+      bankConnectionId = connection.id;
     }
 
     const connectorId = await this.getMeuPluggyConnectorId();
+    const attempt = await this.prisma.pluggyConnectionAttempt.create({
+      data: {
+        userId,
+        bankConnectionId,
+        expectedItemId: itemId,
+        expiresAt: new Date(
+          Date.now() + BankConnectionsService.connectTokenTtlMs,
+        ),
+      },
+    });
+    const isUpdate = Boolean(itemId);
     const body: Record<string, unknown> = {
       options: {
-        clientUserId: userId,
         avoidDuplicates: true,
+        // clientUserId identifies newly created Items. Updating an Item must
+        // preserve its original ownership reference instead of replacing it.
+        ...(!isUpdate ? { clientUserId: attempt.id } : {}),
       },
-      ...(itemId ? { itemId } : {}),
+      ...(isUpdate ? { itemId } : {}),
     };
-    const token = await this.pluggyRequest<{ accessToken?: string }>(
-      '/connect_token',
-      { method: 'POST', body: JSON.stringify(body) },
-    );
-    if (!token.accessToken)
-      throw new BadGatewayException('Pluggy did not return a connect token');
-    const attemptId = randomUUID();
+    let token: { accessToken?: string };
+    try {
+      token = await this.pluggyRequest<{ accessToken?: string }>(
+        '/connect_token',
+        { method: 'POST', body: JSON.stringify(body) },
+      );
+      if (!token.accessToken) {
+        throw new BadGatewayException('Pluggy did not return a connect token');
+      }
+    } catch (error) {
+      await this.prisma.pluggyConnectionAttempt.update({
+        where: { id: attempt.id },
+        data: {
+          status: PluggyConnectionAttemptStatus.FAILED,
+          errorCode: 'CONNECT_TOKEN_ERROR',
+        },
+      });
+      throw error;
+    }
     this.logger.log(
       JSON.stringify({
         event: 'pluggy_connection_attempt_started',
-        attemptId,
+        attemptId: attempt.id,
         userId,
         reconnect: Boolean(connectionId),
       }),
     );
-    return { accessToken: token.accessToken, connectorId, attemptId };
+    return {
+      accessToken: token.accessToken,
+      connectorId,
+      attemptId: attempt.id,
+      mode: isUpdate ? ('UPDATE' as const) : ('CREATE' as const),
+      ...(itemId ? { updateItemId: itemId } : {}),
+    };
   }
 
   async reportConnectionAttemptError(
@@ -152,17 +188,16 @@ export class BankConnectionsService {
       occurredAt: string;
     },
   ) {
+    const attempt = await this.findOwnedAttempt(userId, input.attemptId);
+    await this.assertAttemptPending(attempt);
     let connectionPreserved = false;
+    let connectionId = attempt.bankConnectionId;
 
     if (input.itemId) {
       const item = await this.pluggyRequest<PluggyItem>(
         `/items/${input.itemId}`,
       );
-      if (item.clientUserId !== userId) {
-        throw new UnauthorizedException(
-          'This bank connection belongs to another user',
-        );
-      }
+      await this.assertAttemptOwnsItem(userId, attempt, item);
       const existing = await this.prisma.bankConnection.findUnique({
         where: { externalItemId: input.itemId },
       });
@@ -172,6 +207,7 @@ export class BankConnectionsService {
         );
       }
       const connection = await this.upsertConnection(userId, item);
+      connectionId = connection.id;
       await this.prisma.bankConnection.update({
         where: { id: connection.id },
         data: {
@@ -181,6 +217,16 @@ export class BankConnectionsService {
       });
       connectionPreserved = true;
     }
+
+    await this.prisma.pluggyConnectionAttempt.update({
+      where: { id: attempt.id },
+      data: {
+        bankConnectionId: connectionId,
+        resultItemId: input.itemId,
+        status: PluggyConnectionAttemptStatus.FAILED,
+        errorCode: input.code,
+      },
+    });
 
     this.logger.warn(
       JSON.stringify({
@@ -197,13 +243,18 @@ export class BankConnectionsService {
     return { accepted: true as const };
   }
 
-  async completeConnection(userId: string, itemId: string) {
-    const item = await this.pluggyRequest<PluggyItem>(`/items/${itemId}`);
-    if (item.clientUserId && item.clientUserId !== userId) {
-      throw new UnauthorizedException(
-        'This bank connection belongs to another user',
-      );
+  async completeConnection(userId: string, attemptId: string, itemId: string) {
+    const attempt = await this.findOwnedAttempt(userId, attemptId);
+    if (attempt.status === PluggyConnectionAttemptStatus.COMPLETED) {
+      if (attempt.resultItemId !== itemId) {
+        throw new ConflictException('Connection attempt already completed');
+      }
+      return this.findCompletedConnection(userId, itemId);
     }
+    await this.assertAttemptPending(attempt);
+    this.assertExpectedItem(attempt.expectedItemId, itemId);
+    const item = await this.pluggyRequest<PluggyItem>(`/items/${itemId}`);
+    await this.assertAttemptOwnsItem(userId, attempt, item);
     const existing = await this.prisma.bankConnection.findUnique({
       where: { externalItemId: itemId },
     });
@@ -212,13 +263,58 @@ export class BankConnectionsService {
         'This bank connection belongs to another user',
       );
     }
-    await this.upsertConnection(userId, item);
-    await this.syncItem(userId, itemId);
-    const connection = await this.prisma.bankConnection.findUniqueOrThrow({
-      where: { externalItemId: itemId },
-      include: { accounts: true },
+
+    const claimed = await this.prisma.pluggyConnectionAttempt.updateMany({
+      where: {
+        id: attempt.id,
+        userId,
+        status: PluggyConnectionAttemptStatus.PENDING,
+        expiresAt: { gt: new Date() },
+      },
+      data: {
+        status: PluggyConnectionAttemptStatus.PROCESSING,
+        resultItemId: itemId,
+      },
     });
-    return { ...connection, accountCount: connection.accounts.length };
+    if (claimed.count === 0) {
+      const current = await this.findOwnedAttempt(userId, attempt.id);
+      if (
+        current.status === PluggyConnectionAttemptStatus.COMPLETED &&
+        current.resultItemId === itemId
+      ) {
+        return this.findCompletedConnection(userId, itemId);
+      }
+      throw new ConflictException('Connection attempt is already in progress');
+    }
+
+    try {
+      const connection = await this.upsertConnection(userId, item);
+      await this.syncItem(
+        userId,
+        itemId,
+        attempt.expectedItemId ? undefined : attempt.id,
+      );
+      await this.prisma.pluggyConnectionAttempt.update({
+        where: { id: attempt.id },
+        data: {
+          bankConnectionId: connection.id,
+          resultItemId: itemId,
+          status: PluggyConnectionAttemptStatus.COMPLETED,
+          completedAt: new Date(),
+          errorCode: null,
+        },
+      });
+      return this.findCompletedConnection(userId, itemId);
+    } catch (error) {
+      await this.prisma.pluggyConnectionAttempt.update({
+        where: { id: attempt.id },
+        data: {
+          status: PluggyConnectionAttemptStatus.FAILED,
+          errorCode: this.errorCode(error),
+        },
+      });
+      throw error;
+    }
   }
 
   async sync(userId: string, id: string) {
@@ -291,6 +387,15 @@ export class BankConnectionsService {
     if (!externalId || !payload.event) {
       throw new BadRequestException('Webhook eventId and event are required');
     }
+    this.logger.log(
+      JSON.stringify({
+        event: 'pluggy_webhook_received',
+        webhookEvent: payload.event,
+        externalId,
+        itemId: payload.itemId ?? null,
+        clientUserId: payload.clientUserId ?? null,
+      }),
+    );
     try {
       await this.prisma.webhookEvent.create({
         data: {
@@ -392,19 +497,60 @@ export class BankConnectionsService {
         const existing = await this.prisma.bankConnection.findUnique({
           where: { externalItemId: payload.itemId },
         });
-        const userId = existing?.userId ?? payload.clientUserId;
-        if (userId) {
+        const item = await this.pluggyRequest<PluggyItem>(
+          `/items/${payload.itemId}`,
+        );
+        const owner = await this.resolveWebhookOwner(item, payload, existing);
+        if (owner) {
+          const connection = await this.upsertConnection(owner.userId, item);
           if (event.event === 'item/error') {
-            await this.prisma.bankConnection.updateMany({
-              where: { externalItemId: payload.itemId, userId },
+            const errorCode =
+              payload.error?.code ??
+              item.error?.code ??
+              item.executionStatus ??
+              'ERROR';
+            await this.prisma.bankConnection.update({
+              where: { id: connection.id },
               data: {
                 status: BankConnectionStatus.ERROR,
-                errorCode: payload.error?.code ?? null,
+                errorCode,
               },
             });
-          } else {
-            await this.syncItem(userId, payload.itemId);
+            if (owner.attemptId) {
+              await this.prisma.pluggyConnectionAttempt.updateMany({
+                where: {
+                  id: owner.attemptId,
+                  status: {
+                    in: [
+                      PluggyConnectionAttemptStatus.PENDING,
+                      PluggyConnectionAttemptStatus.PROCESSING,
+                    ],
+                  },
+                },
+                data: {
+                  bankConnectionId: connection.id,
+                  resultItemId: item.id,
+                  status: PluggyConnectionAttemptStatus.FAILED,
+                  errorCode,
+                },
+              });
+            }
+          } else if (
+            !event.event.startsWith('item/waiting_') &&
+            item.status !== 'UPDATING' &&
+            !item.executionStatus?.endsWith('_IN_PROGRESS')
+          ) {
+            await this.syncItem(owner.userId, payload.itemId, owner.attemptId);
           }
+        } else {
+          this.logger.warn(
+            JSON.stringify({
+              event: 'pluggy_webhook_missing_owner',
+              webhookEvent: event.event,
+              externalId,
+              itemId: payload.itemId,
+            }),
+          );
         }
       }
       await this.prisma.webhookEvent.update({
@@ -429,16 +575,50 @@ export class BankConnectionsService {
     }
   }
 
-  private async syncItem(userId: string, itemId: string) {
+  private async syncItem(
+    userId: string,
+    itemId: string,
+    expectedClientUserId?: string,
+  ) {
     const item = await this.pluggyRequest<PluggyItem>(`/items/${itemId}`);
-    if (item.clientUserId && item.clientUserId !== userId) {
-      throw new UnauthorizedException('Connection ownership mismatch');
+    if (expectedClientUserId) {
+      this.assertItemAttempt(item, expectedClientUserId);
+    } else {
+      const owned = await this.prisma.bankConnection.findFirst({
+        where: { externalItemId: itemId, userId },
+      });
+      if (!owned) {
+        throw new UnauthorizedException('Connection ownership mismatch');
+      }
     }
     const connection = await this.upsertConnection(userId, item);
     const accountsResponse = await this.pluggyRequest<{
       results?: PluggyAccount[];
     }>(`/accounts?itemId=${encodeURIComponent(itemId)}`);
-    for (const account of accountsResponse.results ?? []) {
+    const accounts = accountsResponse.results ?? [];
+    const accountIds = accounts.map((account) => account.id);
+    const duplicateAccount = accountIds.length
+      ? await this.prisma.bankAccount.findFirst({
+          where: {
+            externalAccountId: { in: accountIds },
+            bankConnectionId: { not: connection.id },
+          },
+        })
+      : null;
+    if (duplicateAccount) {
+      await this.prisma.bankConnection.update({
+        where: { id: connection.id },
+        data: {
+          status: BankConnectionStatus.ERROR,
+          errorCode: 'DUPLICATE_BANK_ACCOUNT',
+        },
+      });
+      throw new ConflictException(
+        'Esta conta bancária já foi importada por outra conexão do Gatekeep.',
+      );
+    }
+
+    for (const account of accounts) {
       const savedAccount = await this.prisma.bankAccount.upsert({
         where: { externalAccountId: account.id },
         update: {
@@ -614,6 +794,153 @@ export class BankConnectionsService {
     return BankConnectionStatus.CONNECTING;
   }
 
+  private async findOwnedAttempt(userId: string, attemptId: string) {
+    const attempt = await this.prisma.pluggyConnectionAttempt.findFirst({
+      where: { id: attemptId, userId },
+    });
+    if (!attempt) {
+      throw new NotFoundException('Connection attempt not found');
+    }
+    return attempt;
+  }
+
+  private async assertAttemptPending(attempt: {
+    id: string;
+    status: PluggyConnectionAttemptStatus;
+    expiresAt: Date;
+  }) {
+    if (attempt.expiresAt.getTime() <= Date.now()) {
+      await this.prisma.pluggyConnectionAttempt.updateMany({
+        where: {
+          id: attempt.id,
+          status: PluggyConnectionAttemptStatus.PENDING,
+        },
+        data: { status: PluggyConnectionAttemptStatus.EXPIRED },
+      });
+      throw new BadRequestException('Connection attempt expired');
+    }
+    if (attempt.status !== PluggyConnectionAttemptStatus.PENDING) {
+      throw new ConflictException('Connection attempt is no longer available');
+    }
+  }
+
+  private assertItemAttempt(item: PluggyItem, attemptId: string) {
+    if (item.clientUserId !== attemptId) {
+      throw new UnauthorizedException('Connection ownership mismatch');
+    }
+  }
+
+  private assertExpectedItem(expectedItemId: string | null, itemId: string) {
+    if (expectedItemId && expectedItemId !== itemId) {
+      throw new UnauthorizedException('Connection item does not match attempt');
+    }
+  }
+
+  private async assertAttemptOwnsItem(
+    userId: string,
+    attempt: {
+      id: string;
+      bankConnectionId: string | null;
+      expectedItemId: string | null;
+    },
+    item: PluggyItem,
+  ) {
+    this.assertExpectedItem(attempt.expectedItemId, item.id);
+    if (!attempt.expectedItemId) {
+      this.assertItemAttempt(item, attempt.id);
+      return;
+    }
+
+    if (!attempt.bankConnectionId) {
+      throw new UnauthorizedException('Connection ownership mismatch');
+    }
+    const connection = await this.prisma.bankConnection.findFirst({
+      where: {
+        id: attempt.bankConnectionId,
+        userId,
+        externalItemId: item.id,
+      },
+    });
+    if (!connection) {
+      throw new UnauthorizedException('Connection ownership mismatch');
+    }
+  }
+
+  private async findCompletedConnection(userId: string, itemId: string) {
+    const connection = await this.prisma.bankConnection.findUnique({
+      where: { externalItemId: itemId },
+      include: { accounts: true },
+    });
+    if (!connection || connection.userId !== userId) {
+      throw new NotFoundException('Bank connection not found');
+    }
+    return { ...connection, accountCount: connection.accounts.length };
+  }
+
+  private async resolveWebhookOwner(
+    item: PluggyItem,
+    payload: PluggyWebhook,
+    existing: { userId: string } | null,
+  ) {
+    if (payload.itemId !== item.id) {
+      throw new UnauthorizedException('Webhook item mismatch');
+    }
+    const reference = item.clientUserId;
+    if (existing) {
+      if (reference && this.isUuid(reference)) {
+        const attempt = await this.prisma.pluggyConnectionAttempt.findUnique({
+          where: { id: reference },
+        });
+        if (attempt && attempt.userId !== existing.userId) {
+          throw new UnauthorizedException('Connection ownership mismatch');
+        }
+      }
+      return { userId: existing.userId, attemptId: undefined };
+    }
+
+    if (reference && this.isUuid(reference)) {
+      const attempt = await this.prisma.pluggyConnectionAttempt.findUnique({
+        where: { id: reference },
+      });
+      if (attempt) {
+        this.assertItemAttempt(item, attempt.id);
+        const activeAttempt =
+          attempt.expiresAt.getTime() > Date.now() &&
+          (attempt.status === PluggyConnectionAttemptStatus.PENDING ||
+            attempt.status === PluggyConnectionAttemptStatus.PROCESSING);
+        if (!existing && !activeAttempt) {
+          if (
+            attempt.expiresAt.getTime() <= Date.now() &&
+            attempt.status === PluggyConnectionAttemptStatus.PENDING
+          ) {
+            await this.prisma.pluggyConnectionAttempt.updateMany({
+              where: {
+                id: attempt.id,
+                status: PluggyConnectionAttemptStatus.PENDING,
+              },
+              data: { status: PluggyConnectionAttemptStatus.EXPIRED },
+            });
+          }
+          return null;
+        }
+        return { userId: attempt.userId, attemptId: attempt.id };
+      }
+    }
+    return null;
+  }
+
+  private isUuid(value: string) {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      value,
+    );
+  }
+
+  private errorCode(error: unknown) {
+    if (error instanceof ConflictException) return 'DUPLICATE_BANK_ACCOUNT';
+    if (error instanceof UnauthorizedException) return 'OWNERSHIP_MISMATCH';
+    return 'CONNECTION_COMPLETION_ERROR';
+  }
+
   private async findOwned(userId: string, id: string) {
     const connection = await this.prisma.bankConnection.findFirst({
       where: { id, userId },
@@ -646,7 +973,7 @@ export class BankConnectionsService {
         payload.code === 'ITEM_USER_ALREADY_EXIST'
       ) {
         throw new BadRequestException(
-          'Este banco já foi compartilhado com o Gatekeep. No Meu Pluggy, revogue o acesso do Gatekeep para este banco e tente novamente. Sua conexão original continuará ativa.',
+          'A Pluggy informou que estas credenciais já possuem uma conexão ativa. Confirme se você está reconectando o banco existente; se o erro persistir, contate o suporte da Pluggy.',
         );
       }
       if (payload.code === 'TRIAL_CLIENT_ITEM_CREATE_NOT_ALLOWED') {

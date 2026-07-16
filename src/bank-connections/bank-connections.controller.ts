@@ -54,7 +54,11 @@ export class BankConnectionsController {
     @CurrentUser() user: AuthenticatedUser,
     @Body() dto: CompleteConnectionDto,
   ) {
-    return this.bankConnectionsService.completeConnection(user.id, dto.itemId);
+    return this.bankConnectionsService.completeConnection(
+      user.id,
+      dto.attemptId,
+      dto.itemId,
+    );
   }
 
   @Post('bank-connections/:id/sync')
