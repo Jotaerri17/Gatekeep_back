@@ -40,6 +40,7 @@ describe('BankConnectionsService', () => {
       upsert: jest.fn(),
       update: jest.fn(),
       updateMany: jest.fn(),
+      deleteMany: jest.fn(),
     },
     bankAccount: {
       findFirst: jest.fn(),
@@ -141,7 +142,6 @@ describe('BankConnectionsService', () => {
     expect(parsedBody).toEqual({
       options: {
         clientUserId: attemptId,
-        avoidDuplicates: true,
       },
     });
   });
@@ -188,7 +188,6 @@ describe('BankConnectionsService', () => {
       },
     });
     expect(JSON.parse(fetchMock.mock.calls[2][1]?.body as string)).toEqual({
-      options: { avoidDuplicates: true },
       itemId,
     });
   });
@@ -479,6 +478,72 @@ describe('BankConnectionsService', () => {
         status: PluggyConnectionAttemptStatus.COMPLETED,
         completedAt: expect.any(Date) as Date,
         errorCode: null,
+      },
+    });
+  });
+
+  it('removes a newly created Item when the bank is already owned globally', async () => {
+    prisma.bankConnection.findUnique.mockResolvedValue(null);
+    prisma.bankConnection.upsert.mockResolvedValue({ id: 'new-connection' });
+    prisma.bankConnection.update.mockResolvedValue({});
+    prisma.bankConnection.deleteMany.mockResolvedValue({ count: 1 });
+    prisma.bankAccount.findFirst.mockResolvedValue({
+      id: 'existing-account',
+      userId: 'other-user',
+      bankConnectionId: 'existing-connection',
+    });
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ apiKey: 'api-key' }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: itemId,
+            clientUserId: attemptId,
+            connector: { id: 200, name: 'MeuPluggy' },
+            executionStatus: 'SUCCESS',
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: itemId,
+            clientUserId: attemptId,
+            connector: { id: 200, name: 'MeuPluggy' },
+            executionStatus: 'SUCCESS',
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            results: [{ id: 'account-id', name: 'Conta Corrente' }],
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+
+    await expect(
+      service.completeConnection('user-id', attemptId, itemId),
+    ).rejects.toBeInstanceOf(ConflictException);
+
+    expect(fetchMock.mock.calls[4]).toEqual([
+      `https://api.pluggy.ai/items/${itemId}`,
+      expect.objectContaining({ method: 'DELETE' }),
+    ]);
+    expect(prisma.bankConnection.deleteMany).toHaveBeenCalledWith({
+      where: { externalItemId: itemId, userId: 'user-id' },
+    });
+    expect(prisma.pluggyConnectionAttempt.update).toHaveBeenLastCalledWith({
+      where: { id: attemptId },
+      data: {
+        status: PluggyConnectionAttemptStatus.FAILED,
+        errorCode: 'DUPLICATE_BANK_ACCOUNT',
       },
     });
   });

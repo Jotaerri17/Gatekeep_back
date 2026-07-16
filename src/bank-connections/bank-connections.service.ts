@@ -133,15 +133,17 @@ export class BankConnectionsService {
       },
     });
     const isUpdate = Boolean(itemId);
-    const body: Record<string, unknown> = {
-      options: {
-        avoidDuplicates: true,
-        // clientUserId identifies newly created Items. Updating an Item must
-        // preserve its original ownership reference instead of replacing it.
-        ...(!isUpdate ? { clientUserId: attempt.id } : {}),
-      },
-      ...(isUpdate ? { itemId } : {}),
-    };
+    const body: Record<string, unknown> = isUpdate
+      ? { itemId }
+      : {
+          options: {
+            // MeuPluggy authenticates the user's Data Passport before the bank
+            // selection. avoidDuplicates would therefore reject a second bank
+            // shared by the same MeuPluggy login before returning an itemId.
+            // Gatekeep enforces ownership and duplicate accounts after creation.
+            clientUserId: attempt.id,
+          },
+        };
     let token: { accessToken?: string };
     try {
       token = await this.pluggyRequest<{ accessToken?: string }>(
@@ -306,11 +308,15 @@ export class BankConnectionsService {
       });
       return this.findCompletedConnection(userId, itemId);
     } catch (error) {
+      const errorCode = this.errorCode(error);
+      if (!attempt.expectedItemId && errorCode === 'DUPLICATE_BANK_ACCOUNT') {
+        await this.discardRejectedNewItem(userId, item, attempt.id);
+      }
       await this.prisma.pluggyConnectionAttempt.update({
         where: { id: attempt.id },
         data: {
           status: PluggyConnectionAttemptStatus.FAILED,
-          errorCode: this.errorCode(error),
+          errorCode,
         },
       });
       throw error;
@@ -613,9 +619,11 @@ export class BankConnectionsService {
           errorCode: 'DUPLICATE_BANK_ACCOUNT',
         },
       });
-      throw new ConflictException(
-        'Esta conta bancária já foi importada por outra conexão do Gatekeep.',
-      );
+      throw new ConflictException({
+        code: 'DUPLICATE_BANK_ACCOUNT',
+        message:
+          'Esta conta bancária já foi importada por outra conexão do Gatekeep.',
+      });
     }
 
     for (const account of accounts) {
@@ -936,9 +944,64 @@ export class BankConnectionsService {
   }
 
   private errorCode(error: unknown) {
-    if (error instanceof ConflictException) return 'DUPLICATE_BANK_ACCOUNT';
+    if (error instanceof ConflictException) {
+      const response = error.getResponse();
+      if (
+        response &&
+        typeof response === 'object' &&
+        'code' in response &&
+        response.code === 'DUPLICATE_BANK_ACCOUNT'
+      ) {
+        return 'DUPLICATE_BANK_ACCOUNT';
+      }
+      return 'CONNECTION_CONFLICT';
+    }
     if (error instanceof UnauthorizedException) return 'OWNERSHIP_MISMATCH';
     return 'CONNECTION_COMPLETION_ERROR';
+  }
+
+  private async discardRejectedNewItem(
+    userId: string,
+    item: PluggyItem,
+    attemptId: string,
+  ) {
+    this.assertItemAttempt(item, attemptId);
+    try {
+      await this.pluggyRequest(`/items/${item.id}`, { method: 'DELETE' });
+    } catch (error) {
+      if (!(error instanceof NotFoundException)) {
+        this.logger.error(
+          JSON.stringify({
+            event: 'pluggy_rejected_item_cleanup_failed',
+            attemptId,
+            itemId: item.id,
+          }),
+        );
+        return;
+      }
+    }
+
+    try {
+      await this.prisma.bankConnection.deleteMany({
+        where: { externalItemId: item.id, userId },
+      });
+    } catch {
+      this.logger.error(
+        JSON.stringify({
+          event: 'pluggy_rejected_connection_cleanup_failed',
+          attemptId,
+          itemId: item.id,
+        }),
+      );
+      return;
+    }
+    this.logger.warn(
+      JSON.stringify({
+        event: 'pluggy_duplicate_bank_item_discarded',
+        attemptId,
+        itemId: item.id,
+      }),
+    );
   }
 
   private async findOwned(userId: string, id: string) {
