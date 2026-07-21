@@ -61,11 +61,6 @@ export class BankConnectionsController {
     );
   }
 
-  @Post('bank-connections/:id/sync')
-  sync(@CurrentUser() user: AuthenticatedUser, @Param('id') id: string) {
-    return this.bankConnectionsService.sync(user.id, id);
-  }
-
   @Delete('bank-connections/:id')
   disconnect(@CurrentUser() user: AuthenticatedUser, @Param('id') id: string) {
     return this.bankConnectionsService.disconnect(user.id, id);

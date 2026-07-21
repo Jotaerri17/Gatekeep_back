@@ -323,13 +323,6 @@ export class BankConnectionsService {
     }
   }
 
-  async sync(userId: string, id: string) {
-    const connection = await this.findOwned(userId, id);
-    await this.syncItem(userId, connection.externalItemId);
-    this.scheduleBackground(() => this.processPendingWebhooks());
-    return { synced: true, syncedAt: new Date() };
-  }
-
   async disconnect(userId: string, id: string) {
     const connection = await this.findOwned(userId, id);
     try {
