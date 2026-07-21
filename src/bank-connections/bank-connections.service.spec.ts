@@ -158,12 +158,6 @@ describe('BankConnectionsService', () => {
         new Response(JSON.stringify({ apiKey: 'api-key' }), { status: 200 }),
       )
       .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({ results: [{ id: 42, name: 'Meu Pluggy' }] }),
-          { status: 200 },
-        ),
-      )
-      .mockResolvedValueOnce(
         new Response(JSON.stringify({ accessToken: 'update-token' }), {
           status: 200,
         }),
@@ -173,7 +167,6 @@ describe('BankConnectionsService', () => {
       service.createConnectToken('user-id', connectionId),
     ).resolves.toEqual({
       accessToken: 'update-token',
-      connectorId: 42,
       attemptId,
       mode: 'UPDATE',
       updateItemId: itemId,
@@ -187,7 +180,8 @@ describe('BankConnectionsService', () => {
         expiresAt: expect.any(Date) as Date,
       },
     });
-    expect(JSON.parse(fetchMock.mock.calls[2][1]?.body as string)).toEqual({
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(fetchMock.mock.calls[1][1]?.body as string)).toEqual({
       itemId,
     });
   });

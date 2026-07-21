@@ -121,7 +121,12 @@ export class BankConnectionsService {
       bankConnectionId = connection.id;
     }
 
-    const connectorId = await this.getMeuPluggyConnectorId();
+    // Update Mode is tied to the existing Item. Passing Meu Pluggy's connector
+    // again makes Connect try to open that connector instead of the Item's own
+    // institution, which can fail when that connector is unavailable.
+    const connectorId = itemId
+      ? undefined
+      : await this.getMeuPluggyConnectorId();
     const attempt = await this.prisma.pluggyConnectionAttempt.create({
       data: {
         userId,
@@ -173,9 +178,9 @@ export class BankConnectionsService {
     );
     return {
       accessToken: token.accessToken,
-      connectorId,
       attemptId: attempt.id,
       mode: isUpdate ? ('UPDATE' as const) : ('CREATE' as const),
+      ...(connectorId ? { connectorId } : {}),
       ...(itemId ? { updateItemId: itemId } : {}),
     };
   }
